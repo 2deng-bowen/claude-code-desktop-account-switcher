@@ -26,6 +26,7 @@ LOG = os.path.join(HERE, "relay.log")
 ALIVE = os.path.join(HERE, "relay.alive")
 PORT = 48620
 UPSTREAM = "api.anthropic.com"
+MAX_BODY = 64 * 1024 * 1024
 HOP = {"host", "authorization", "x-api-key", "connection", "keep-alive", "transfer-encoding", "content-length", "proxy-authorization", "te", "trailer", "upgrade"}
 
 
@@ -95,11 +96,27 @@ class Relay(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _local_only(self) -> bool:
+        """Refuse anything a web page could send: a Host other than this loopback port (DNS rebinding)
+        or browser-only headers (Origin, Sec-Fetch-*). Claude Code sends none of these."""
+        port = self.server.server_address[1]
+        host = (self.headers.get("Host") or "").strip().lower()
+        if host not in (f"127.0.0.1:{port}", f"localhost:{port}"):
+            return False
+        return not any(k.lower() == "origin" or k.lower().startswith("sec-fetch-") for k in self.headers.keys())
+
     def _handle(self) -> None:
+        if not self._local_only():
+            log(f"refused {self.command} from a browser or foreign Host")
+            self._json(403, {"type": "error", "error": {"type": "permission_error", "message": "account-switcher relay: local clients only"}})
+            self.close_connection = True
+            return
         if self.path == "/health":
             self._json(200, {"ok": True, "accounts": sorted(load_tokens().keys())})
             return
-        parts = self.path.split("/", 3)  # ['', 'acct', '<name>', '<rest>']
+        parts = self.path.split("/", 3)
+        if len(parts) >= 3 and not parts[2].replace("-", "").replace("_", "").isalnum():
+            parts = []  # ['', 'acct', '<name>', '<rest>']
         if len(parts) < 4 or parts[1] != "acct":
             self._json(404, {"error": "expected /acct/<name>/..."})
             return
@@ -109,7 +126,14 @@ class Relay(BaseHTTPRequestHandler):
             log(f"no token for account '{name}'")
             self._json(401, {"type": "error", "error": {"type": "authentication_error", "message": f"account-switcher relay: no token stored for account '{name}'"}})
             return
-        length = int(self.headers.get("Content-Length") or 0)
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            length = -1
+        if length < 0 or length > MAX_BODY or "chunked" in (self.headers.get("Transfer-Encoding") or "").lower():
+            self._json(400, {"type": "error", "error": {"type": "invalid_request_error", "message": "account-switcher relay: bad Content-Length"}})
+            self.close_connection = True
+            return
         body = self.rfile.read(length) if length else None
         headers = {k: v for k, v in self.headers.items() if k.lower() not in HOP}
         headers["Authorization"] = f"Bearer {token}"

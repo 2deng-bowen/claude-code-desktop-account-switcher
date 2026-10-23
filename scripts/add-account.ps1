@@ -15,7 +15,9 @@ $err = Join-Path $Store "setup-token-$Name.err.txt"
 Remove-Item $raw, $err -ErrorAction SilentlyContinue
 
 # Resolve the claude executable (PATH or an explicit path).
-$exe = (Get-Command $ClaudeExe -ErrorAction SilentlyContinue).Source
+# npm installs claude.ps1 / claude.cmd / an extensionless sh shim; Start-Process can only launch the .exe or .cmd.
+$exe = Get-Command $ClaudeExe -All -CommandType Application -ErrorAction SilentlyContinue |
+  Where-Object { $_.Source -match '\.(exe|cmd|bat)$' } | Select-Object -First 1 -ExpandProperty Source
 if (-not $exe) { $exe = $ClaudeExe }
 if (-not (Test-Path $exe)) { throw "claude executable not found: $ClaudeExe" }
 
@@ -40,7 +42,7 @@ while ((Get-Date) -lt $deadline) {
   if ($p.HasExited -and -not (Test-Path $raw)) { break }
   Start-Sleep -Seconds 3
 }
-if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue }
+if (-not $p.HasExited) { & taskkill /PID $p.Id /T /F 2>$null | Out-Null }   # /T: a .cmd shim leaves node as a child
 Remove-Item $raw, $err -Force -ErrorAction SilentlyContinue
 Remove-Item $cfg -Recurse -Force -ErrorAction SilentlyContinue
 if (-not $token) { throw "No token captured for '$Name' (sign-in not completed?)" }

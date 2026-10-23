@@ -13,8 +13,20 @@ export type Billing = {
   host: { baseUrl: string | undefined } | null;
 };
 
+/** One account's rate-limit windows as the API last reported them: fractions 0..1, resets in epoch seconds. */
+export type Usage = {
+  at: number;
+  h5: number | null;
+  h5_reset: number | null;
+  d7: number | null;
+  d7_reset: number | null;
+};
+
+/** Usage per account name; WINDOW_KEY ("__window") is the window's own login. */
+export type UsageMap = Record<string, Usage>;
+
 declare module "claude-code" {
   interface PluginState {
-    "account-switcher": { billing: Billing; isHidden: boolean };
+    "account-switcher": { billing: Billing; isHidden: boolean; usage: UsageMap };
   }
 }

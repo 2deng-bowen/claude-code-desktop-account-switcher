@@ -11,29 +11,45 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 $repo = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
-if (-not (Test-Path $Python)) { $Python = (Get-Command pythonw -ErrorAction SilentlyContinue).Source }
-if (-not $Python) { throw "pythonw.exe not found; install Python 3 and re-run" }
+# Find pythonw.exe: the given path, then the py launcher's Python 3, then PATH. The WindowsApps
+# "python" aliases are Store stubs (they open the Store when no Python is installed), so skip them.
+if (-not (Test-Path $Python)) {
+  $Python = $null
+  if (Get-Command py -ErrorAction SilentlyContinue) {
+    $exe = & py -3 -c "import sys; print(sys.executable)" 2>$null
+    if ($exe) { $w = Join-Path (Split-Path -Parent $exe) 'pythonw.exe'; if (Test-Path $w) { $Python = $w } }
+  }
+  if (-not $Python) {
+    $Python = Get-Command pythonw -All -ErrorAction SilentlyContinue | Where-Object { $_.Source -notmatch '\\WindowsApps\\' } |
+      Select-Object -First 1 -ExpandProperty Source
+  }
+}
+if (-not $Python) { throw "pythonw.exe not found; install Python 3.8+ from python.org (not the Store alias) and re-run" }
+$PythonCli = Join-Path (Split-Path -Parent $Python) 'python.exe'
+if (-not (Test-Path $PythonCli)) { throw "python.exe not found beside $Python" }
+& $PythonCli -I -c "import sys; sys.exit(0 if sys.version_info >= (3, 8) else 1)"
+if ($LASTEXITCODE -ne 0) { throw "$PythonCli is older than Python 3.8" }
+Write-Host "Using $Python"
 
 # 1. files
-New-Item -ItemType Directory -Force "$Store\plugin" | Out-Null
+New-Item -ItemType Directory -Force "$Store\plugin", "$Store\scripts" | Out-Null
 Copy-Item "$repo\plugin\*" "$Store\plugin" -Recurse -Force
 Copy-Item "$repo\relay\relay.py" "$Store\relay.py" -Force
-Write-Host "Installed files into $Store"
+Copy-Item "$repo\scripts\*" "$Store\scripts" -Force
+# Only this user (and SYSTEM) may read the store: tokens.json lives here.
+& icacls $Store /inheritance:r /grant:r "${env:USERNAME}:(OI)(CI)F" "*S-1-5-18:(OI)(CI)F" /Q | Out-Null
+if ($LASTEXITCODE -ne 0) { throw "icacls failed on $Store" }
+& icacls "$Store\*" /reset /T /Q | Out-Null   # children inherit exactly the store's ACL
+if ($LASTEXITCODE -ne 0) { throw "icacls /reset failed under $Store" }
+Write-Host "Installed files into $Store (access limited to $env:USERNAME)"
 
-# 2. settings.json env (keeps every other key; one timestamped backup)
-if (Test-Path $Settings) {
-  Copy-Item $Settings "$Settings.bak-account-switcher-$(Get-Date -Format yyyyMMdd-HHmmss)"
-  $json = Get-Content $Settings -Raw | ConvertFrom-Json
-} else { $json = [pscustomobject]@{} }
-if (-not $json.env) { $json | Add-Member -NotePropertyName env -NotePropertyValue ([pscustomobject]@{}) }
+# 2. settings.json env (keeps every other key; one timestamped backup). Python edits it: UTF-8 in and
+#    out with no BOM, which Windows PowerShell's Get-Content / Set-Content -Encoding utf8 can't promise.
+if (Test-Path $Settings) { Copy-Item $Settings "$Settings.bak-account-switcher-$(Get-Date -Format yyyyMMdd-HHmmss)" }
 $pluginDir = "$Store\plugin"
-$existing = $json.env.CLAUDE_CODE_PLUGIN_DIRS
-$dirs = @()
-if ($existing) { $dirs = $existing -split ';' | Where-Object { $_ -and ($_ -notmatch 'account-switcher') } }
-$dirs += $pluginDir
-$json.env | Add-Member -NotePropertyName CLAUDE_CODE_PLUGIN_DIRS -NotePropertyValue ($dirs -join ';') -Force
-($json | ConvertTo-Json -Depth 20) | Set-Content -Path $Settings -Encoding utf8
-$check = (Get-Content $Settings -Raw | ConvertFrom-Json).env.CLAUDE_CODE_PLUGIN_DIRS
+& $PythonCli -I "$repo\scripts\settings_env.py" add $Settings $pluginDir | Out-Null
+if ($LASTEXITCODE -ne 0) { throw "could not update $Settings" }
+$check = & $PythonCli -I -c "import json,sys; print(json.load(open(sys.argv[1],encoding='utf-8'))['env']['CLAUDE_CODE_PLUGIN_DIRS'])" $Settings
 if ($check -notmatch [regex]::Escape($pluginDir)) { throw "settings.json did not take CLAUDE_CODE_PLUGIN_DIRS" }
 Write-Host "settings.json env.CLAUDE_CODE_PLUGIN_DIRS = $check"
 
@@ -48,8 +64,14 @@ Register-ScheduledTask -TaskName $taskName -Action $action -Trigger @($logon, $r
 Write-Host "Registered scheduled task $taskName"
 
 # 4. start now and verify the heartbeat (stop a hand-started relay first, by pid file)
-$pidFile = "$Store\relay.pid"
-if (Test-Path $pidFile) { $old = Get-Process -Id (Get-Content $pidFile) -ErrorAction SilentlyContinue; if ($old -and $old.ProcessName -match '^python') { Stop-Process -Id $old.Id -Force; Start-Sleep 1 }; Remove-Item $pidFile -Force }
+# The running relay's pid is in its heartbeat (relay.py writes no pid file): stop it so an update's
+# relay.py takes over, and drop the heartbeat so the check below waits for the new process's own.
+$aliveFile = "$Store\relay.alive"
+if (Test-Path $aliveFile) {
+  try { $prev = Get-Content $aliveFile -Raw | ConvertFrom-Json; $old = Get-Process -Id $prev.pid -ErrorAction SilentlyContinue } catch { $old = $null }
+  if ($old -and $old.ProcessName -match '^python') { Stop-Process -Id $old.Id -Force; Start-Sleep 1 }
+  Remove-Item $aliveFile -Force -ErrorAction SilentlyContinue
+}
 Start-ScheduledTask -TaskName $taskName
 $ok = $false
 for ($i = 0; $i -lt 10; $i++) { Start-Sleep 1; if (Test-Path "$Store\relay.alive") { $hb = Get-Content "$Store\relay.alive" -Raw | ConvertFrom-Json; if (([DateTimeOffset]::UtcNow.ToUnixTimeSeconds() - $hb.at) -lt 30) { $ok = $true; break } } }

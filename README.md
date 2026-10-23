@@ -1,9 +1,45 @@
-# claude-account-switcher
+# claude-code-desktop-account-switcher
+
+在**同一个** Claude Code desktop（或终端）里，让不同的会话用不同的 Claude 订阅账号计费。不用登出、不用重启。
+
+这是 [SmelterLabs/claude-account-switcher](https://github.com/SmelterLabs/claude-account-switcher)（MIT，作者 Casey Russell）的 fork，在它的基础上：
+
+- **输入框上方是一个下拉框**：选账号就切换，每个账号后面带着它最近的 5 小时 / 7 天用量；旁边一行是当前账号的用量和重置倒计时（`↻3小时`）。每 15 秒刷新一次。
+- **relay 加固**：只接受本机 Claude Code 的请求（检查 `Host`，拒绝带 `Origin` / `Sec-Fetch-*` 的浏览器请求，防 DNS rebinding 借用额度），账号名和请求体大小也做了检查。
+- **Windows 安装修好了**：`settings.json` 用 Python 读写（UTF-8、不加 BOM，原来的 PowerShell 写法会加 BOM、读中文会乱码）；存 token 的目录只有当前用户能读；`add-account.ps1` 能找到 npm 装的 `claude.cmd`；安装脚本能通过 `py` 启动器找到 Python，并跳过 Store 的假 `python`。
+
+## 在另一台 Windows 电脑上安装
+
+先准备：Claude Code desktop（或 `claude` 命令行）、[Python 3.8+](https://www.python.org/downloads/)（python.org 的安装包，不是 Microsoft Store 版）、Git。
+
+在 PowerShell 里运行：
+
+```powershell
+git clone https://github.com/2deng-bowen/claude-code-desktop-account-switcher "$HOME\.claude\account-switcher-src"
+powershell -ExecutionPolicy Bypass -File "$HOME\.claude\account-switcher-src\scripts\install.ps1"
+```
+
+然后每个想用的账号加一次（会打开浏览器，用**那个账号**登录并批准）：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File "$HOME\.claude\account-switcher\scripts\add-account.ps1" -Name work
+```
+
+装好后新开一个 Claude Code 会话（已经开着的会话输入 `/reload-plugins`），输入框上方就有账号下拉框。也可以直接把这个仓库链接发给那台电脑上的 Claude Code，让它按这一节装。
+
+- **token 每台电脑单独加**，不要把 `tokens.json` 传到网上或给别人。
+- 更新：`git -C "$HOME\.claude\account-switcher-src" pull`，再跑一次 `install.ps1`，然后 `/reload-plugins`。
+- 卸载：`powershell -ExecutionPolicy Bypass -File "$HOME\.claude\account-switcher\scripts\uninstall.ps1"`（加 `-PurgeTokens` 连 token 一起删）。
+- `add-account` 停在 `Waiting...` 超过 10 秒：先在那个窗口按一下 Esc（Windows 控制台被点中会进入“选择”模式而暂停），再不行就关掉重跑。
+
+---
+
+*Original README (upstream), with the band and install URLs updated for this fork:*
 
 Bill a Claude Code session to a different Claude subscription, per project or on demand, inside **one** Claude Desktop app or one terminal. No logout, no restart, no second copy of the app.
 
 - A project folder with `.claude/account` containing `work` bills every session opened there to the account named `work`.
-- A band above the prompt shows the account in force with one button per account that has a token: one click switches the current session from its next message; `off` returns it to the app's own login; `hide` puts the band away (remembered; `/account show` brings it back).
+- A band above the prompt holds a dropdown: the app's own login and every account that has a token, each with its last 5-hour / 7-day usage. A pick switches the current session from its next message; beside it, the chosen account's usage and when each window resets; `hide` puts the band away (remembered; `/account show` brings it back).
 - `/account <name>` does the same by keyboard; `/account off` returns to the app's own login; `/account` shows status, token expiry and each account's real usage meters.
 - The status line reads `💳 billing: WORK` whenever a session is routed. If the relay is down or has no token for the name, the session stays on the app's login and the status line says so.
 
@@ -32,17 +68,17 @@ Requirements: Claude Code 2.1.280 or later (for `CLAUDE_CODE_PLUGIN_DIRS`), Pyth
 ### Windows (current user)
 
 ```powershell
-git clone https://github.com/SmelterLabs/claude-account-switcher.git
+git clone https://github.com/2deng-bowen/claude-code-desktop-account-switcher.git claude-account-switcher
 .\claude-account-switcher\scripts\install.ps1
 .\claude-account-switcher\scripts\add-account.ps1 -Name work     # browser opens: sign in as that account, approve
 ```
 
-`install.ps1` copies the plugin and relay to `~/.claude/account-switcher`, adds `CLAUDE_CODE_PLUGIN_DIRS` to the `env` block of `~/.claude/settings.json` (backup kept), registers the per-user scheduled task `ClaudeAccountRelay` (starts at logon, 5-minute self-recovery) and starts it. Needs `pythonw.exe` on the PATH or in the default python.org location.
+`install.ps1` copies the plugin and relay to `~/.claude/account-switcher`, adds `CLAUDE_CODE_PLUGIN_DIRS` to the `env` block of `~/.claude/settings.json` (backup kept), registers the per-user scheduled task `ClaudeAccountRelay` (starts at logon, 5-minute self-recovery) and starts it. Finds `pythonw.exe` in the default python.org location, through the `py` launcher, or on the PATH (never the WindowsApps Store stub), and needs Python 3.8 or later.
 
 ### Linux (tested) and macOS (untested)
 
 ```bash
-git clone https://github.com/SmelterLabs/claude-account-switcher.git
+git clone https://github.com/2deng-bowen/claude-code-desktop-account-switcher.git claude-account-switcher
 ./claude-account-switcher/scripts/install.sh
 ./claude-account-switcher/scripts/add-account.sh work        # browser opens or a sign-in URL is shown; approve
 ```
@@ -59,7 +95,7 @@ Open a new Claude Code session afterwards; existing sessions do not load the plu
 ## Use
 
 - Put `.claude/account` with the account name in any project that should bill another account.
-- In a session: click an account in the band above the prompt, or `/account`, `/account work`, `/account off`, `/account hide`, `/account show`.
+- In a session: pick an account in the dropdown above the prompt, or `/account`, `/account work`, `/account off`, `/account hide`, `/account show`.
 - Renew a token near expiry (the status line warns at 14 days): run add-account for that name again.
 - Remove: `scripts\uninstall.ps1` / `scripts/uninstall.sh` (`-PurgeTokens` / `--purge-tokens` to delete the token store too).
 
