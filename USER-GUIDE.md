@@ -22,7 +22,7 @@ Works on Windows and macOS with the Claude Desktop app and with terminal Claude 
 |---|---|
 | `💳 billing: WORK` | This session's model calls go to the `work` account. |
 | `💳 billing: WORK ⚠ token expires in 9d` | Same, and that token needs renewing soon (see below). |
-| `⚠ WORK: relay down · billing window account` | The relay isn't running, so the session fell back to the app's account. Start it (see below) or log off and on. |
+| `⚠ WORK: relay not answering · requests retry until it is back` | The relay isn't answering. The session stays on WORK (it never quietly bills the app's account) and its requests retry; the relay restarts by itself within a minute. Press the band's button to use the app's account instead. |
 | `⚠ WORK: no token · billing window account` | No token stored for that name. Add one (see below). |
 | (nothing) | The session is on the app's account. |
 

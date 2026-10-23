@@ -65,16 +65,23 @@ Write-Host "Registered scheduled task $taskName"
 
 # 4. start now and verify the heartbeat (stop a hand-started relay first, by pid file)
 # The running relay's pid is in its heartbeat (relay.py writes no pid file): stop it so an update's
-# relay.py takes over, and drop the heartbeat so the check below waits for the new process's own.
+# relay.py takes over. The heartbeat file stays: while it is fresh, open sessions keep their route
+# through the restart (a request in the gap is retried) instead of falling back to the window login.
+# The check below waits for a heartbeat from a different process.
 $aliveFile = "$Store\relay.alive"
+$oldPid = $null
 if (Test-Path $aliveFile) {
   try { $prev = Get-Content $aliveFile -Raw | ConvertFrom-Json; $old = Get-Process -Id $prev.pid -ErrorAction SilentlyContinue } catch { $old = $null }
-  if ($old -and $old.ProcessName -match '^python') { Stop-Process -Id $old.Id -Force; Start-Sleep 1 }
-  Remove-Item $aliveFile -Force -ErrorAction SilentlyContinue
+  if ($old -and $old.ProcessName -match '^python') { $oldPid = $old.Id; Stop-Process -Id $old.Id -Force; Start-Sleep -Milliseconds 300 }
 }
 Start-ScheduledTask -TaskName $taskName
 $ok = $false
-for ($i = 0; $i -lt 10; $i++) { Start-Sleep 1; if (Test-Path "$Store\relay.alive") { $hb = Get-Content "$Store\relay.alive" -Raw | ConvertFrom-Json; if (([DateTimeOffset]::UtcNow.ToUnixTimeSeconds() - $hb.at) -lt 30) { $ok = $true; break } } }
+for ($i = 0; $i -lt 20; $i++) {
+  Start-Sleep -Milliseconds 500
+  if (-not (Test-Path $aliveFile)) { continue }
+  try { $hb = Get-Content $aliveFile -Raw | ConvertFrom-Json } catch { continue }
+  if ($hb.pid -ne $oldPid -and ([DateTimeOffset]::UtcNow.ToUnixTimeSeconds() - $hb.at) -lt 30) { $ok = $true; break }
+}
 if (-not $ok) { throw "relay did not start (no fresh heartbeat in $Store\relay.alive)" }
 Write-Host "Relay running: pid $($hb.pid), port $($hb.port), accounts: $($hb.accounts -join ', ')"
 Write-Host "Done. Add accounts with scripts\add-account.ps1 -Name <name>; open a new Claude Code session, or type /reload-plugins in an open one, to load the plugin."

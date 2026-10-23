@@ -4,7 +4,10 @@
 
 这是 [SmelterLabs/claude-account-switcher](https://github.com/SmelterLabs/claude-account-switcher)（MIT，作者 Casey Russell）的 fork，在它的基础上：
 
-- **输入框上方是一个下拉框**：选账号就切换，每个账号后面带着它最近的 5 小时 / 7 天用量；旁边一行是当前账号的用量和重置倒计时（`↻3小时`）。每 15 秒刷新一次。
+- **输入框上方是一个下拉框 + 用量表**：选账号就切换；下面每个账号一行，5 小时 / 7 天各一条用量条（70% 变黄、90% 变红）、百分比和重置倒计时（`↻2h10m`），按窗口宽度自动收缩，不会被截断；用满的账号在下拉框里标“已满”。可以折叠成一行（“收起”），每 15 秒刷新。
+- **subagent 跟着切**：每一个模型请求（主对话和所有 subagent）发出前都重新指向当前账号，切号后正在跑的 subagent 下一个请求就换过去。
+- **不会偷偷退回窗口账号**：原版在读 relay 状态失败时会悄悄把整个会话换回 desktop 登录的账号，那个号额度用完就是莫名其妙的 rate limit。现在选了账号就一直走它；relay 真的没响应时请求会重试，输入框上方会提示，并给一个“改用窗口账号”的按钮。
+- **查哪些请求绕过了 relay**：`python "$HOME\.claude\account-switcher\scripts\check-routing.py" <会话 id>`，逐条对照会话记录和 relay 日志（主对话 + 每个 subagent）。
 - **relay 加固**：只接受本机 Claude Code 的请求（检查 `Host`，拒绝带 `Origin` / `Sec-Fetch-*` 的浏览器请求，防 DNS rebinding 借用额度），账号名和请求体大小也做了检查。
 - **Windows 安装修好了**：`settings.json` 用 Python 读写（UTF-8、不加 BOM，原来的 PowerShell 写法会加 BOM、读中文会乱码）；存 token 的目录只有当前用户能读；`add-account.ps1` 能找到 npm 装的 `claude.cmd`；安装脚本能通过 `py` 启动器找到 Python，并跳过 Store 的假 `python`。
 
@@ -41,7 +44,7 @@ Bill a Claude Code session to a different Claude subscription, per project or on
 - A project folder with `.claude/account` containing `work` bills every session opened there to the account named `work`.
 - A band above the prompt holds a dropdown: the app's own login and every account that has a token, each with its last 5-hour / 7-day usage. A pick switches the current session from its next message; beside it, the chosen account's usage and when each window resets; `hide` puts the band away (remembered; `/account show` brings it back).
 - `/account <name>` does the same by keyboard; `/account off` returns to the app's own login; `/account` shows status, token expiry and each account's real usage meters.
-- The status line reads `💳 billing: WORK` whenever a session is routed. If the relay is down or has no token for the name, the session stays on the app's login and the status line says so.
+- The status line reads `💳 billing: WORK` whenever a session is routed. Every model request, main's and every subagent's, is pointed at the chosen account right before it is sent. A chosen account is never swapped for the app's login behind your back: if the relay is not answering, requests keep going to it and retry (the band offers a one-press switch to the app's login); only a name the relay holds no token for falls back, and the status line says so.
 
 | Platform | Installer | Service | Status |
 |---|---|---|---|

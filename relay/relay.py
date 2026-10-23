@@ -170,7 +170,9 @@ class Relay(BaseHTTPRequestHandler):
             pass
         finally:
             up.close()
-        log(f"{name} {self.command} {rest} -> {resp.status} {sent}B {time.time() - t0:.1f}s")
+        # The upstream request id is what a transcript records per reply: it ties each reply to the
+        # account that served it.
+        log(f"{name} {self.command} {rest} -> {resp.status} {sent}B {time.time() - t0:.1f}s {resp.getheader('request-id') or '-'}")
         self.close_connection = True
 
     do_GET = do_POST = do_PUT = do_DELETE = do_PATCH = _handle
@@ -179,11 +181,24 @@ class Relay(BaseHTTPRequestHandler):
 def heartbeat(port: int) -> None:
     """Rewrite relay.alive every 10 s so the plugin can see the relay is up without an HTTP call."""
 
+    def write(text: str) -> None:
+        # Write beside it and swap in whole: a reader never sees a truncated file (which the plugin
+        # would take for "relay down" and route that moment to the window login). On Windows the
+        # swap fails while a reader holds the file open, so retry briefly.
+        tmp = ALIVE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(text)
+        for _ in range(20):
+            try:
+                os.replace(tmp, ALIVE)
+                return
+            except PermissionError:
+                time.sleep(0.05)
+
     def loop():
         while True:
             try:
-                with open(ALIVE, "w", encoding="utf-8") as f:
-                    f.write(json.dumps({"port": port, "pid": os.getpid(), "at": time.time(), "accounts": sorted(load_tokens().keys()), "expires": load_expiry(), "usage": dict(USAGE)}))
+                write(json.dumps({"port": port, "pid": os.getpid(), "at": time.time(), "accounts": sorted(load_tokens().keys()), "expires": load_expiry(), "usage": dict(USAGE)}))
             except OSError:
                 pass
             time.sleep(10)
