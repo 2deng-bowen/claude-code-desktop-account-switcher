@@ -55,6 +55,9 @@ let warned = false;
 let routedTo: string | null = null; // where this session's requests go now; null = the window login
 let autoTimes: number[] = []; // when the recent automatic switches happened
 let pendingContinue = false; // an automatic switch is waiting to send CONTINUE_TEXT
+let skipResetContinue = false; // drop the engine's own continue at the limit reset: we already moved on
+// The prompt Claude Code queues itself when a usage limit it waited out resets.
+const RESET_CONTINUE = /usage limit has reset/i;
 const CONTINUE_DELAY_MS = 3000;
 
 function sendContinue($: any): void {
@@ -455,13 +458,24 @@ export function register(on: any) {
     await probe($);
     // A submit from here would wait on the turn this hook holds: send it once the turn has ended
     // (turn.complete), or from the timer should no turn.complete follow.
-    if (await autoMove($, "hit its limit")) {
+    // The engine has also armed its own "continue when the limit resets"; once we have moved on and
+    // sent 继续 that one is stale, so it is dropped when it arrives (and let through otherwise).
+    skipResetContinue = !!(await autoMove($, "hit its limit"));
+    if (skipResetContinue) {
       pendingContinue = true;
       $.clock.after(CONTINUE_DELAY_MS, () => sendContinue($));
     }
     return result;
   });
-  on("prompt.submit", async ($: any, e: any, next: any) => { await reapply($); return next(e); });
+
+  on("prompt.submit", async ($: any, e: any, next: any) => {
+    if (skipResetContinue && (e.isMeta || e.origin) && RESET_CONTINUE.test(e.text ?? "")) {
+      skipResetContinue = false;
+      return { drop: "account-switcher: already switched accounts and continued — skipping the built-in continue at the limit reset" };
+    }
+    await reapply($);
+    return next(e);
+  });
 
   // Before every model request, main's or a subagent's (`e.agentId`): a subagent started before a
   // switch sends its next request on the new account, and no request goes out on a stale route.

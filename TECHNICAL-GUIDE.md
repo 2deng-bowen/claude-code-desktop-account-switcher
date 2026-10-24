@@ -81,7 +81,7 @@ Rejected / closed routes:
 
 ## Auto-switch
 
-`classic.StopFailure` with `error: "rate_limit"` on the main thread (no `agent_id`): marks the account rejected, probes everyone, moves to the relay account with the most room (never `__window`), and sends 「继续」 with `$.prompt.submit` from the next main `turn.complete`, or a 3 s timer if none follows (the host refuses a submit from inside the StopFailure hook). `turn.start` moves first when the current account's reading is already refused. Guard: at most 4 automatic switches in 10 minutes. Off switch: `$.store` key `auto.switch`.
+`classic.StopFailure` with `error: "rate_limit"` on the main thread (no `agent_id`): marks the account rejected, probes everyone, moves to the relay account with the most room (never `__window`), and sends 「继续」 with `$.prompt.submit` from the next main `turn.complete`, or a 3 s timer if none follows (the host refuses a submit from inside the StopFailure hook). `turn.start` moves first when the current account's reading is already refused. Guard: at most 4 automatic switches in 10 minutes. Claude Code also arms its own "continue when the limit resets" on the same 429; after a successful automatic switch the plugin drops that one stale prompt ("Your claude.ai usage limit has reset…") in `prompt.submit`, and lets it through when no switch happened. Off switch: `$.store` key `auto.switch`.
 
 ## Open items
 

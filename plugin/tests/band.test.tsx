@@ -354,3 +354,35 @@ test("auto-switch never picks the window login, even when it alone has room", as
   expect(env.ANTHROPIC_BASE_URL).toBe(`${RELAY}/acct/vbp`);
   expect(submitted).toEqual([]);
 });
+
+// Claude Code's own continue, queued when a limit it waited out resets.
+const RESET_PROMPT = "Your claude.ai usage limit has reset. Continue the task you were working on when the limit was reached; do not repeat work that is already complete.";
+
+test("after an automatic switch, Claude Code's own continue at the limit reset is dropped once", async ($, on) => {
+  mock.store(on);
+  world(on, alive(), { ANTHROPIC_BASE_URL: "https://host.example" });
+  probes(on, { vbp: rejected(2), personal: reading(0.1, 4, 0.1, 3) });
+  await $.session.start({ cwd: "C:/work/project", surface: "terminal", isInteractive: true });
+  await $.command.run({ command: "account", args: "vbp" } as any);
+  await $.classic.StopFailure({ error: "rate_limit" } as any);
+  await clock.advance(5_000);
+  expect(submitted).toEqual(["继续"]);
+
+  const r = await $.prompt.submit({ text: RESET_PROMPT, isMeta: true, wait: false } as any);
+  expect(r.drop).toMatch(/already switched/);
+  expect(submitted).toEqual(["继续"]);
+  // A second one (a later limit the engine waited out on its own) goes through.
+  await $.prompt.submit({ text: RESET_PROMPT, isMeta: true, wait: false } as any);
+  expect(submitted.at(-1)).toBe(RESET_PROMPT);
+});
+
+test("with nothing to switch to, Claude Code's own continue at the reset goes through", async ($, on) => {
+  mock.store(on);
+  world(on, alive(), { ANTHROPIC_BASE_URL: "https://host.example" });
+  probes(on, { vbp: rejected(2), personal2: rejected(1), personal: rejected(3) });
+  await $.session.start({ cwd: "C:/work/project", surface: "terminal", isInteractive: true });
+  await $.command.run({ command: "account", args: "vbp" } as any);
+  await $.classic.StopFailure({ error: "rate_limit" } as any);
+  await $.prompt.submit({ text: RESET_PROMPT, isMeta: true, wait: false } as any);
+  expect(submitted).toEqual([RESET_PROMPT]);
+});
