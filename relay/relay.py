@@ -11,6 +11,9 @@ Files beside this script:
   relay.alive   heartbeat rewritten every 10 s: port, pid, time, account names
   relay.log     one line per request: account, method, path, status, bytes, seconds
 Health: GET /health -> {"ok": true, "accounts": [names]}
+Probe:  GET /probe[?acct=<name>] -> {"usage": {...}}: asks each account (or one) for its usage now
+        with a one-token request; the relay also does this by itself every PROBE_EVERY seconds for
+        readings that went stale, so the plugin's usage table reflects every account, used or not.
 """
 import http.client
 import json
@@ -18,6 +21,8 @@ import os
 import sys
 import threading
 import time
+import urllib.parse
+from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -61,8 +66,17 @@ def load_expiry() -> dict:
     return {n: e["expiresAt"] for n, e in read_store().items() if isinstance(e, dict) and e.get("expiresAt")}
 
 
-USAGE: dict = {}  # {name: {"at", "h5", "h5_reset", "d7", "d7_reset"}} from the last reply that carried the headers
+USAGE: dict = {}  # {name: {"at", "h5", "h5_reset", "d7", "d7_reset", "status", "reset"}} from the last reply that carried the headers
 _RL = "anthropic-ratelimit-unified-"
+PROBE_EVERY = 15 * 60  # a reading older than this is refreshed by a probe
+PROBE_MODEL = "claude-haiku-5-5"
+# A subscription token is served only as Claude Code: without this system prompt and beta the API
+# answers 429 with no usage headers.
+PROBE_BODY = json.dumps({
+    "model": PROBE_MODEL, "max_tokens": 1,
+    "system": [{"type": "text", "text": "You are Claude Code, Anthropic's official CLI for Claude."}],
+    "messages": [{"role": "user", "content": "."}],
+}).encode()
 
 
 def note_usage(name: str, resp) -> None:
@@ -77,9 +91,65 @@ def note_usage(name: str, resp) -> None:
             "h5_reset": int(resp.getheader(_RL + "5h-reset") or 0) or None,
             "d7": float(d7) if d7 is not None else None,
             "d7_reset": int(resp.getheader(_RL + "7d-reset") or 0) or None,
+            # "allowed" / "allowed_warning" / "rejected": rejected means this account is refused
+            # until "reset", whichever window it is that ran out.
+            "status": resp.getheader(_RL + "status"),
+            "reset": int(resp.getheader(_RL + "reset") or 0) or None,
         }
     except (TypeError, ValueError):
         pass
+
+
+def probe(name: str) -> None:
+    """Read one account's usage with a one-token request (counted against that account, barely)."""
+    token = load_tokens().get(name)
+    if not token:
+        return
+    headers = {
+        "Authorization": f"Bearer {token}", "Content-Type": "application/json", "anthropic-version": "2023-06-01",
+        "anthropic-beta": "claude-code-20250219,oauth-2025-04-20", "Content-Length": str(len(PROBE_BODY)), "Connection": "close",
+    }
+    try:
+        up = http.client.HTTPSConnection(UPSTREAM, timeout=30)
+        up.request("POST", "/v1/messages", body=PROBE_BODY, headers=headers)
+        resp = up.getresponse()
+        resp.read()
+        note_usage(name, resp)
+        u = USAGE.get(name) or {}
+        log(f"{name} probe -> {resp.status} {u.get('status') or '-'} 5h={u.get('h5')} 7d={u.get('d7')}")
+        up.close()
+    except Exception as e:
+        log(f"{name} probe error {type(e).__name__}")
+
+
+def probe_all(names=None) -> None:
+    names = list(names if names is not None else load_tokens().keys())
+    if names:
+        with ThreadPoolExecutor(max_workers=len(names)) as ex:
+            list(ex.map(probe, names))
+
+
+def stale(name: str) -> bool:
+    u = USAGE.get(name)
+    if not u:
+        return True
+    now = time.time()
+    if now - u["at"] > PROBE_EVERY:
+        return True
+    # A window that has reset since the reading: its figure no longer holds.
+    return any(r and r <= now for r in (u.get("h5_reset"), u.get("d7_reset"), u.get("reset")))
+
+
+def prober() -> None:
+    def loop():
+        while True:
+            try:
+                probe_all([n for n in load_tokens() if stale(n)])
+            except Exception as e:
+                log(f"prober error {type(e).__name__}")
+            time.sleep(60)
+
+    threading.Thread(target=loop, daemon=True).start()
 
 
 class Relay(BaseHTTPRequestHandler):
@@ -113,6 +183,13 @@ class Relay(BaseHTTPRequestHandler):
             return
         if self.path == "/health":
             self._json(200, {"ok": True, "accounts": sorted(load_tokens().keys())})
+            return
+        url = urllib.parse.urlsplit(self.path)
+        if url.path == "/probe":
+            q = urllib.parse.parse_qs(url.query)
+            known = load_tokens().keys()
+            probe_all([n for n in q.get("acct", known) if n in known])
+            self._json(200, {"usage": dict(USAGE)})
             return
         parts = self.path.split("/", 3)
         if len(parts) >= 3 and not parts[2].replace("-", "").replace("_", "").isalnum():
@@ -210,6 +287,7 @@ if __name__ == "__main__":
     port = int(sys.argv[1]) if len(sys.argv) > 1 else PORT
     log(f"relay starting on 127.0.0.1:{port}")
     heartbeat(port)
+    prober()
     try:
         ThreadingHTTPServer(("127.0.0.1", port), Relay).serve_forever()
     except OSError as e:  # port already held by a running relay: exit quietly

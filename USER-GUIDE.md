@@ -12,6 +12,8 @@ Works on Windows and macOS with the Claude Desktop app and with terminal Claude 
 
 **Or by keyboard.** Type `/account work` in the session; from your next message on, that session bills the `work` account. `/account off` puts it back on the app's own account. `/account` on its own tells you what the session is doing, whether the relay is up, which accounts have tokens, when each token expires, and each account's real usage (5-hour and weekly, with reset times).
 
+**When an account runs out.** With auto-switch on (the default; the "自动切换" button above the prompt, or `/account auto on|off`), a turn that stops because the account hit its usage limit moves to the added account with the most room left and sends 「继续」 for you, so the work picks up where it stopped. A turn about to start on an account already known to be full moves first. It never switches to the app's own account by itself; if every added account is full it only tells you so.
+
 **Where to read usage.** Use `/account`. The app's own usage panel, and a session asked "what's my usage", report the account the app is signed into, not the account a switched session is billing.
 
 **Nothing set?** The session just uses the account the app is signed into, exactly as before.

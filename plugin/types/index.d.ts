@@ -4,7 +4,7 @@ export type Billing = {
   /** The account this session bills, or null for the window's own login. */
   account: string | null;
   /** How the account was chosen. */
-  source: "marker" | "command" | "button" | null;
+  source: "marker" | "command" | "button" | "auto" | null;
   /** Accounts the relay holds a token for; empty while the relay is down. */
   accounts: string[];
   /** Whether the relay answered a fresh heartbeat. */
@@ -20,6 +20,10 @@ export type Usage = {
   h5_reset: number | null;
   d7: number | null;
   d7_reset: number | null;
+  /** The API's verdict on the reply: "rejected" means refused until `reset`; absent on older readings. */
+  status?: string | null;
+  /** When a rejected account is served again, epoch seconds. */
+  reset?: number | null;
 };
 
 /** Usage per account name; WINDOW_KEY ("__window") is the window's own login. */
@@ -27,6 +31,6 @@ export type UsageMap = Record<string, Usage>;
 
 declare module "claude-code" {
   interface PluginState {
-    "account-switcher": { billing: Billing; isHidden: boolean; isCollapsed: boolean; usage: UsageMap };
+    "account-switcher": { billing: Billing; isHidden: boolean; isCollapsed: boolean; usage: UsageMap; autoSwitch: boolean };
   }
 }

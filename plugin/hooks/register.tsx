@@ -9,8 +9,14 @@
 // model requests change accounts. A chosen account is never swapped for the window login behind
 // the person's back: with the relay not answering, requests keep going to it (and retry); only
 // an account the relay holds no token for falls back, and the status line says so. The plugin
-// never reads or logs a token; expiry dates and usage come from the relay's heartbeat file, and
-// the window login's usage from the session's own rate-limit readings.
+// never reads or logs a token; expiry dates and usage come from the relay's heartbeat file (the
+// relay probes every account itself, used or not), and the window login's usage from the API's
+// own usage endpoint (through `$.session.authorize`) or the session's rate-limit readings.
+//
+// Auto-switch (on by default, "自动" in the band, `/account auto on|off`): when a turn dies on the
+// usage limit, the session moves to the relay account with the most room left (never the window
+// login) and sends "继续" so the work goes on; and a turn about to start on an account already
+// known to be refused moves first.
 
 import { atom, read, update } from "claude-code";
 import type { Billing, Usage, UsageMap } from "../types";
@@ -25,6 +31,11 @@ const COLLAPSED_KEY = "band.collapsed"; // $.store: so does folding the usage ta
 const WINDOW_USAGE_KEY = "usage.window"; // $.store: the window login's last reading outlives the session
 const WINDOW = "__window"; // the dropdown's value (and usage key) for the window's own login
 const WINDOW_NAME = "窗口账号";
+const AUTO_KEY = "auto.switch"; // $.store: auto-switch on a usage limit, on unless turned off
+const CONTINUE_TEXT = "继续";
+const AUTO_MAX = 4; // at most this many automatic switches ...
+const AUTO_SPAN_MS = 10 * 60_000; // ... within this span, so a refusal on every account cannot loop
+const USAGE_API = "https://api.anthropic.com/api/oauth/usage";
 
 type Heartbeat = { port: number; pid: number; at: number; accounts: string[]; expires?: Record<string, string>; usage?: Record<string, Usage> };
 type RateLimit = { kind: string; percentUsed: number; resetsAt?: string };
@@ -36,11 +47,21 @@ const billing = atom({ plugin: "account-switcher", key: "billing" } as const, {
 const isHidden = atom({ plugin: "account-switcher", key: "isHidden" } as const, false);
 const isCollapsed = atom({ plugin: "account-switcher", key: "isCollapsed" } as const, false);
 const usage = atom({ plugin: "account-switcher", key: "usage" } as const, {} as UsageMap);
+const autoSwitch = atom({ plugin: "account-switcher", key: "autoSwitch" } as const, true);
 
 let store = "";
 let hb: Heartbeat | null = null;
 let warned = false;
 let routedTo: string | null = null; // where this session's requests go now; null = the window login
+let autoTimes: number[] = []; // when the recent automatic switches happened
+let pendingContinue = false; // an automatic switch is waiting to send CONTINUE_TEXT
+const CONTINUE_DELAY_MS = 3000;
+
+function sendContinue($: any): void {
+  if (!pendingContinue) return;
+  pendingContinue = false;
+  $.prompt.submit({ text: CONTINUE_TEXT }).catch(() => {});
+}
 
 // ---- usage figures --------------------------------------------------------------------------
 
@@ -56,7 +77,9 @@ function win(v: number | null, reset: number | null): Win {
 }
 
 const windows = (u: Usage) => [win(u.h5, u.h5_reset), win(u.d7, u.d7_reset)] as const;
-const isFull = (u?: Usage) => !!u && windows(u).some((w) => w.state === "full");
+// Refused now: a window at 100%, or the API's own "rejected" verdict whose reset has not come.
+const isRejected = (u?: Usage) => !!u && u.status === "rejected" && (!u.reset || u.reset * 1000 > Date.now());
+const isFull = (u?: Usage) => !!u && (isRejected(u) || windows(u).some((w) => w.state === "full"));
 
 // Theme color for a window: green, amber from 70%, red from 90% or full.
 function tone(w: Win): "success" | "warning" | "error" | undefined {
@@ -134,6 +157,78 @@ async function refreshUsage($: any, fresh: Record<string, Usage> = {}): Promise<
   put(WINDOW, (await $.store.get(WINDOW_USAGE_KEY)) as Usage | undefined);
   for (const [k, u] of Object.entries(fresh)) put(k, u);
   if (JSON.stringify(merged) !== JSON.stringify(cur)) await update($, usage, () => merged);
+}
+
+// The window login's usage from the API's usage endpoint (what /usage shows); the credential stays
+// on the host. Null when the session has no first-party login or the call fails.
+async function probeWindow($: any): Promise<Usage | null> {
+  try {
+    const auth = (await $.session.authorize())?.handle;
+    if (!auth) return null;
+    const r = await $.http.fetch(USAGE_API, { auth, headers: { "anthropic-beta": "oauth-2025-04-20" } });
+    if (!r.ok) return null;
+    const j = JSON.parse(r.text);
+    const frac = (w: any) => (typeof w?.utilization === "number" ? w.utilization / 100 : null);
+    const sec = (w: any) => { const t = w?.resets_at ? Date.parse(w.resets_at) : NaN; return Number.isFinite(t) ? Math.round(t / 1000) : null; };
+    const u: Usage = { at: Date.now() / 1000, h5: frac(j.five_hour), h5_reset: sec(j.five_hour), d7: frac(j.seven_day), d7_reset: sec(j.seven_day) };
+    if ((u.h5 ?? 0) >= 1 || (u.d7 ?? 0) >= 1) { u.status = "rejected"; u.reset = (u.h5 ?? 0) >= 1 ? u.h5_reset : u.d7_reset; }
+    await $.store.set(WINDOW_USAGE_KEY, u);
+    return u;
+  } catch { return null; }
+}
+
+// Fresh readings for every account now: the relay probes the token accounts (one-token requests),
+// the API's usage endpoint answers for the window login. Folded into the band's map.
+async function probe($: any): Promise<void> {
+  const fresh: Record<string, Usage> = {};
+  const relay = (async () => {
+    try {
+      const r = await $.http.fetch(`${RELAY}/probe`);
+      if (r.ok) Object.assign(fresh, JSON.parse(r.text).usage ?? {});
+    } catch { /* relay down: the heartbeat's readings stand */ }
+  })();
+  const w = await probeWindow($);
+  await relay;
+  if (w) fresh[WINDOW] = w;
+  await refreshUsage($, fresh);
+}
+
+// The relay account with the most room left, other than `not`; null when every one is refused.
+// Never the window login: an automatic switch does not bill the desktop app's own account.
+// Unread accounts rank after read ones with room.
+async function bestAccount($: any, not: string): Promise<string | null> {
+  const u = await read($, usage);
+  const room = (k: string) => {
+    const x = u[k];
+    if (!x) return 0.5;
+    const [h5, d7] = windows(x);
+    return 1 - Math.max(h5.pct ?? 0, d7.pct ?? 0) / 100;
+  };
+  const names = (hb?.accounts ?? []).filter((k) => k !== not && !isFull(u[k]));
+  names.sort((a, b) => room(b) - room(a));
+  return names[0] ?? null;
+}
+
+// Move off a refused account: to the best other one, within the loop guard. Returns the account
+// moved to (WINDOW for the window login), or null with the reason toasted.
+async function autoMove($: any, why: string): Promise<string | null> {
+  const now = Date.now();
+  autoTimes = autoTimes.filter((t) => now - t < AUTO_SPAN_MS);
+  if (autoTimes.length >= AUTO_MAX) {
+    $.ui.toast(`account-switcher: ${AUTO_MAX} automatic switches in ${AUTO_SPAN_MS / 60000} minutes — stopping; pick an account by hand`);
+    return null;
+  }
+  const from = (await read($, billing)).account ?? WINDOW;
+  const to = await bestAccount($, from);
+  if (!to) {
+    $.ui.toast("account-switcher: every relay account is at its limit — nothing to switch to (the window account is never picked automatically)");
+    return null;
+  }
+  autoTimes.push(now);
+  await apply($, to, "auto");
+  const name = (k: string) => (k === WINDOW ? WINDOW_NAME : k);
+  $.ui.toast(`account-switcher: ${name(from)} ${why} → switched to ${name(to)}`);
+  return to;
 }
 
 // ---- routing --------------------------------------------------------------------------------
@@ -239,6 +334,18 @@ async function tick($: any): Promise<void> {
   hb = await readHeartbeat($);
   if (JSON.stringify([!!hb, hb?.accounts ?? []]) !== before) await reapply($);
   else await refreshUsage($);
+  if (Date.now() - lastWindowProbe > WINDOW_PROBE_MS) {
+    lastWindowProbe = Date.now();
+    const w = await probeWindow($);
+    if (w) await refreshUsage($, { [WINDOW]: w });
+  }
+}
+let lastWindowProbe = 0;
+const WINDOW_PROBE_MS = 5 * 60_000;
+
+async function setAuto($: any, on: boolean): Promise<void> {
+  await update($, autoSwitch, () => on);
+  await $.store.set(AUTO_KEY, on);
 }
 
 async function setHidden($: any, hidden: boolean): Promise<void> {
@@ -307,6 +414,8 @@ export function register(on: any) {
     const collapsed = (await $.store.get(COLLAPSED_KEY)) === true;
     await update($, isHidden, () => hidden);
     await update($, isCollapsed, () => collapsed);
+    const auto = (await $.store.get(AUTO_KEY)) !== false;
+    await update($, autoSwitch, () => auto);
     const b = await read($, billing);
     if (b.account || b.host) {
       await apply($, b.account, b.source);            // a reload: keep what this session chose
@@ -317,13 +426,41 @@ export function register(on: any) {
     await $.command.register({
       name: "account",
       description: "Bill this session to another Claude account (via the account-switcher relay)",
-      argumentHint: "[name | off | status | show | hide]",
+      argumentHint: "[name | off | status | refresh | auto on|off | show | hide]",
     });
     $.clock.every(REFRESH_MS, () => { tick($).catch(() => {}); });
+    probe($).catch(() => {});
     return next(e);
   });
 
-  on("turn.start", async ($: any, e: any, next: any) => { await reapply($); return next(e); });
+  // A main turn about to start on an account already known to be refused moves first, so its
+  // first request does not spend itself on a 429.
+  on("turn.start", async ($: any, e: any, next: any) => {
+    await reapply($);
+    if (e.agentId === undefined && (await read($, autoSwitch))) {
+      const b = await read($, billing);
+      if (isFull((await read($, usage))[b.account ?? WINDOW])) await autoMove($, "is at its limit");
+    }
+    return next(e);
+  });
+
+  // A turn that died on the usage limit: mark the account refused, re-read everyone, move to the
+  // account with the most room and send "继续" so the work picks up where it stopped.
+  on("classic.StopFailure", async ($: any, e: any, next: any) => {
+    const result = await next(e);
+    if (e.error !== "rate_limit" || e.agent_id || !(await read($, autoSwitch))) return result;
+    const k = (await read($, billing)).account ?? WINDOW;
+    const cur = (await read($, usage))[k];
+    await refreshUsage($, { [k]: { ...(cur ?? { h5: null, h5_reset: null, d7: null, d7_reset: null }), at: Date.now() / 1000, status: "rejected", reset: cur?.reset ?? null } });
+    await probe($);
+    // A submit from here would wait on the turn this hook holds: send it once the turn has ended
+    // (turn.complete), or from the timer should no turn.complete follow.
+    if (await autoMove($, "hit its limit")) {
+      pendingContinue = true;
+      $.clock.after(CONTINUE_DELAY_MS, () => sendContinue($));
+    }
+    return result;
+  });
   on("prompt.submit", async ($: any, e: any, next: any) => { await reapply($); return next(e); });
 
   // Before every model request, main's or a subagent's (`e.agentId`): a subagent started before a
@@ -337,6 +474,7 @@ export function register(on: any) {
   // account that served it; the window login's reading is also stored for later sessions.
   on("turn.complete", async ($: any, e: any, next: any) => {
     const result = await next(e);
+    if (e.agentId === undefined) sendContinue($);
     if (e.agentId === undefined) {
       try {
         const u = fromRateLimits((await $.session.usage()).rateLimits ?? []);
@@ -390,10 +528,13 @@ export function register(on: any) {
       const s = await apply($, name, name ? "button" : null);
       $.ui.toast(`account-switcher: ${s} — from the next message on (subagents too)`);
     };
+    const auto = await read($, autoSwitch);
     const header = (
       <Box key="head" flexDirection="row" gap={1}>
         <Select key="acct" label="💳" options={options} value={b.account ?? WINDOW} onSelect={choose} />
         {collapsed && <Box flexShrink={1}><Text dimColor wrap="truncate-end">{detail(u[current])}</Text></Box>}
+        <Button key="auto" label={auto ? "自动切换 ✓" : "自动切换 ✗"} dimColor={!auto} onPress={() => setAuto($, !auto)} />
+        <Button key="probe" label="↻" dimColor onPress={() => probe($)} />
         <Button key="fold" label={collapsed ? "用量 ▾" : "收起 ▴"} dimColor onPress={() => setCollapsed($, !collapsed)} />
         {hide}
       </Box>
@@ -423,7 +564,8 @@ export function register(on: any) {
       for (const n of known) { const d = daysLeft(hb?.expires?.[n]); if (d !== null) lines.push(`  ${n}: token expires in ${d} days`); }
       for (const n of [WINDOW, ...known]) if (u[n]) lines.push(`  ${n === WINDOW ? "window account" : n} usage: ${detail(u[n])}`);
       lines.push(`Band above the prompt: ${(await read($, isHidden)) ? "hidden (/account show)" : "shown (/account hide)"}`);
-      lines.push("Usage: /account <name> · /account off · marker file .claude/account in a project");
+      lines.push(`Auto-switch on the usage limit: ${(await read($, autoSwitch)) ? "on" : "off"} (/account auto on|off)`);
+      lines.push("Usage: /account <name> · /account off · /account refresh · marker file .claude/account in a project");
       return { text: lines.join("\n") };
     }
     if (arg === "show" || arg === "hide") {
@@ -432,6 +574,16 @@ export function register(on: any) {
     }
     if (arg === "off") {
       return { text: await apply($, null, null) };
+    }
+    if (arg === "auto on" || arg === "auto off" || arg === "auto") {
+      const enable = arg === "auto" ? !(await read($, autoSwitch)) : arg === "auto on";
+      await setAuto($, enable);
+      return { text: enable ? `Auto-switch on: a turn that hits the usage limit moves to the account with the most room and sends "${CONTINUE_TEXT}".` : "Auto-switch off." };
+    }
+    if (arg === "refresh") {
+      await probe($);
+      const u = await read($, usage);
+      return { text: [WINDOW, ...known].filter((n) => u[n]).map((n) => `${n === WINDOW ? WINDOW_NAME : n}: ${isRejected(u[n]) ? "已满 · " : ""}${detail(u[n])}`).join("\n") || "No readings." };
     }
     if (!known.includes(arg)) {
       return { text: hb ? `No token for '${arg}'. Known: ${known.join(", ") || "none"}. Add one with scripts/add-account.ps1 -Name ${arg} (Windows) or scripts/add-account.sh ${arg} (macOS/Linux)` : "Relay is down; start it (Windows: scheduled task ClaudeAccountRelay · Linux: systemctl --user start claude-account-relay · macOS: launchctl kickstart gui/$(id -u)/com.claude-account-switcher.relay) and try again." };

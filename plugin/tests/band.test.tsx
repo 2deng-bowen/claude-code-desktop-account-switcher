@@ -249,3 +249,108 @@ test("a hide remembered in the store keeps the band away; /account show brings i
   expect(await ui.find({ key: "acct" })).toBeDefined();
   await ui.unmount();
 });
+
+// ---- auto-switch on the usage limit ---------------------------------------------------------
+
+// The relay's /probe and the API's usage endpoint answer with these; prompts the plugin sends are kept.
+let submitted: string[] = [];
+function probes(on: any, relayUsage: object, windowUsage: object | null = null) {
+  submitted = [];
+  on("session.authorize", async () => ({ value: windowUsage ? { handle: "h", kind: "oauth" } : null }));
+  on("http.fetch", async (_$: any, e: any) => {
+    if (e.url === `${RELAY}/probe`) return { value: { status: 200, ok: true, headers: {}, text: JSON.stringify({ usage: relayUsage }) } };
+    if (/oauth\/usage$/.test(e.url) && windowUsage) return { value: { status: 200, ok: true, headers: {}, text: JSON.stringify(windowUsage) } };
+    return { value: { status: 404, ok: false, headers: {}, text: "" } };
+  });
+  on("prompt.submit", async (_$: any, e: any) => { submitted.push(e.text); return { text: e.text }; });
+  on("classic.StopFailure", async () => ({}));
+}
+const rejected = (h5h: number) => ({ ...reading(1.01, h5h, 0.3, 3), status: "rejected", reset: now() + h5h * 3600 });
+
+test("a turn that dies on the usage limit moves to the account with the most room and sends 继续", async ($, on) => {
+  mock.store(on);
+  const env = world(on, alive(), { ANTHROPIC_BASE_URL: "https://host.example" });
+  probes(on, { vbp: rejected(2), personal2: reading(0.6, 3, 0.2, 3), personal: reading(0.1, 4, 0.1, 3) });
+  await $.session.start({ cwd: "C:/work/project", surface: "terminal", isInteractive: true });
+  await $.command.run({ command: "account", args: "vbp" } as any);
+
+  await $.classic.StopFailure({ error: "rate_limit" } as any);
+  expect(env.ANTHROPIC_BASE_URL).toBe(`${RELAY}/acct/personal`);
+  expect(submitted).toEqual([]);                    // not while the failed turn is still ending
+  await $.turn.complete({ turnId: "t1", reason: "error", answer: "" } as any);
+  await clock.advance(5_000);                        // the submit lands once idle; the fallback timer finds it sent
+  expect(submitted).toEqual(["继续"]);
+  await step($);
+  expect(sent.at(-1)).toBe(`${RELAY}/acct/personal`);
+});
+
+test("auto-switch leaves the account alone when turned off, on other errors, and on a subagent's failure", async ($, on) => {
+  mock.store(on);
+  const env = world(on, alive(), { ANTHROPIC_BASE_URL: "https://host.example" });
+  probes(on, { vbp: rejected(2), personal: reading(0.1, 4, 0.1, 3) });
+  await $.session.start({ cwd: "C:/work/project", surface: "terminal", isInteractive: true });
+  await $.command.run({ command: "account", args: "vbp" } as any);
+
+  await $.classic.StopFailure({ error: "overloaded" } as any);
+  await $.classic.StopFailure({ error: "rate_limit", agent_id: "a1" } as any);
+  await $.command.run({ command: "account", args: "auto off" } as any);
+  await $.classic.StopFailure({ error: "rate_limit" } as any);
+  expect(env.ANTHROPIC_BASE_URL).toBe(`${RELAY}/acct/vbp`);
+  expect(submitted).toEqual([]);
+});
+
+test("with every account at its limit nothing switches and nothing is sent", async ($, on) => {
+  mock.store(on);
+  const env = world(on, alive(), { ANTHROPIC_BASE_URL: "https://host.example" });
+  probes(on, { vbp: rejected(2), personal2: rejected(1), personal: rejected(3) }, { five_hour: { utilization: 100, resets_at: new Date(Date.now() + 3600e3).toISOString() } });
+  await $.session.start({ cwd: "C:/work/project", surface: "terminal", isInteractive: true });
+  await $.command.run({ command: "account", args: "vbp" } as any);
+  await $.classic.StopFailure({ error: "rate_limit" } as any);
+  await clock.advance(5_000);
+  expect(env.ANTHROPIC_BASE_URL).toBe(`${RELAY}/acct/vbp`);
+  expect(submitted).toEqual([]);
+});
+
+test("with no turn.complete after the failure, the timer sends 继续", async ($, on) => {
+  mock.store(on);
+  world(on, alive(), { ANTHROPIC_BASE_URL: "https://host.example" });
+  probes(on, { vbp: rejected(2), personal: reading(0.1, 4, 0.1, 3) });
+  await $.session.start({ cwd: "C:/work/project", surface: "terminal", isInteractive: true });
+  await $.command.run({ command: "account", args: "vbp" } as any);
+  await $.classic.StopFailure({ error: "rate_limit" } as any);
+  await clock.advance(5_000);
+  expect(submitted).toEqual(["继续"]);
+});
+
+test("a turn about to start on an account known to be refused moves first", async ($, on) => {
+  mock.store(on);
+  const env = world(on, alive({ vbp: rejected(2), personal2: reading(0.3, 3, 0.2, 3), personal: reading(0.5, 3, 0.2, 3) }), { ANTHROPIC_BASE_URL: "https://host.example" });
+  probes(on, {});
+  await $.session.start({ cwd: "C:/work/project", surface: "terminal", isInteractive: true });
+  await $.command.run({ command: "account", args: "vbp" } as any);
+  await $.turn.start({ turnId: "t3" } as any);
+  expect(env.ANTHROPIC_BASE_URL).toBe(`${RELAY}/acct/personal2`);
+  expect(submitted).toEqual([]); // the person's own prompt goes on; nothing extra is sent
+});
+
+test("the window login's usage comes from the API's usage endpoint", async ($, on) => {
+  mock.store(on);
+  world(on, alive(), {});
+  probes(on, {}, { five_hour: { utilization: 42, resets_at: new Date(Date.now() + 2 * 3600e3).toISOString() }, seven_day: { utilization: 17, resets_at: new Date(Date.now() + 3 * 86400e3).toISOString() } });
+  await $.session.start({ cwd: "C:/work/project", surface: "terminal", isInteractive: true });
+  const r = await $.command.run({ command: "account", args: "refresh" } as any);
+  expect(r.text).toMatch(/窗口账号: 5h 42% ↻2h · 7d 17% ↻3d/);
+});
+
+test("auto-switch never picks the window login, even when it alone has room", async ($, on) => {
+  mock.store(on);
+  const env = world(on, alive(), { ANTHROPIC_BASE_URL: "https://host.example" });
+  probes(on, { vbp: rejected(2), personal2: rejected(1), personal: rejected(3) }, { five_hour: { utilization: 5, resets_at: new Date(Date.now() + 3600e3).toISOString() } });
+  await $.session.start({ cwd: "C:/work/project", surface: "terminal", isInteractive: true });
+  await $.command.run({ command: "account", args: "vbp" } as any);
+  await $.classic.StopFailure({ error: "rate_limit" } as any);
+  await $.turn.start({ turnId: "t4" } as any);
+  await clock.advance(5_000);
+  expect(env.ANTHROPIC_BASE_URL).toBe(`${RELAY}/acct/vbp`);
+  expect(submitted).toEqual([]);
+});
