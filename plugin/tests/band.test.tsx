@@ -1,7 +1,8 @@
 // The band above the prompt: a dropdown of the window login and every account the relay has a
 // token for, and under it a table of each account's 5-hour / 7-day usage fitted to the band's
 // width. A pick moves the session's API traffic (subagents' included) to that account, the window
-// entry moves it back, "收起" folds the table and "隐藏" puts the band away, both remembered.
+// entry moves it back, "收起" folds the table (for every session) and "隐藏" puts the band away (in
+// this session alone), both remembered. What a session chose survives a restart of its process.
 import { test, expect, mock } from "claude-code/testing";
 
 const RELAY = "http://127.0.0.1:48620";
@@ -16,6 +17,7 @@ const band = (bodyColumns = 100) => ({
 // would have gone to.
 let clock: any; // the kit's clock world() installs, to move the band's refresh timer
 let sent: (string | undefined)[] = [];
+let sessionId = "s1";
 
 function world(on: any, heartbeat: object | string | null | (() => object | string | null), env: Record<string, string | undefined>, rateLimits: object[] = [], marker?: string) {
   const hb = typeof heartbeat === "function" ? heartbeat : () => heartbeat;
@@ -27,6 +29,8 @@ function world(on: any, heartbeat: object | string | null | (() => object | stri
     if (isMarker(e.path)) return { value: marker };
     return { deny: `unexpected read ${e.path}` };
   });
+  sessionId = "s1";
+  on("session.id", async () => ({ value: sessionId }));
   on("session.cwd", async () => ({ value: "C:/work/project" }));
   on("session.root", async () => ({ value: "C:/work/project" }));
   on("session.start", async (_$: any, e: any) => ({ cwd: e.cwd }));
@@ -157,6 +161,8 @@ test("after a turn on the window login, its rate limits show in the table and ar
   const kept: Record<string, unknown> = {};
   on("store.get", async (_$: any, e: any) => ({ value: kept[e.key] }));
   on("store.set", async (_$: any, e: any) => { kept[e.key] = e.value; return { value: undefined }; });
+  on("store.delete", async (_$: any, e: any) => { delete kept[e.key]; return { value: undefined }; });
+  on("store.keys", async () => ({ value: Object.keys(kept) }));
   const resets = new Date(Date.now() + 90 * 60000).toISOString();
   world(on, alive(), { ANTHROPIC_BASE_URL: "https://host.example" }, [
     { kind: "five_hour", percentUsed: 12, resetsAt: resets },
@@ -175,6 +181,8 @@ test("收起 folds the table to one line, remembered across sessions", async ($,
   const kept: Record<string, unknown> = {};
   on("store.get", async (_$: any, e: any) => ({ value: kept[e.key] }));
   on("store.set", async (_$: any, e: any) => { kept[e.key] = e.value; return { value: undefined }; });
+  on("store.delete", async (_$: any, e: any) => { delete kept[e.key]; return { value: undefined }; });
+  on("store.keys", async () => ({ value: Object.keys(kept) }));
   world(on, alive({ vbp: reading(0.3, 2, 0.1, 4) }), {}, [], "vbp\n");
   await $.session.start({ cwd: "C:/work/project", surface: "desktop", isInteractive: true });
   const ui = await $.ui.mount({ ...band(), surface: "desktop" });
@@ -238,16 +246,125 @@ test("the refresh timer notices a relay that came up and shows the dropdown agai
   await ui.unmount();
 });
 
-test("a hide remembered in the store keeps the band away; /account show brings it back", async ($, on) => {
-  mock.store(on, { "band.hidden": true });
+// A store the test can read back: what later sessions, or a restarted process, would find.
+function keptStore(on: any, kept: Record<string, any> = {}) {
+  on("store.get", async (_$: any, e: any) => ({ value: kept[e.key] }));
+  on("store.set", async (_$: any, e: any) => { kept[e.key] = e.value; return { value: undefined }; });
+  on("store.delete", async (_$: any, e: any) => { delete kept[e.key]; return { value: undefined }; });
+  on("store.keys", async () => ({ value: Object.keys(kept) }));
+  return kept;
+}
+
+test("a hide is this session's alone, kept past a restart; any /account brings the band back", async ($, on) => {
+  const kept = keptStore(on);
+  world(on, alive(), {});
+  await $.session.start({ cwd: "C:/work/project", surface: "desktop", isInteractive: true });
+  const ui = await $.ui.mount({ ...band(), surface: "desktop" });
+  await ui.press({ key: "hide" });
+  expect(await ui.find({ key: "acct" })).toBeUndefined();
+  expect(kept["session.s1"].hidden).toBe(true);
+
+  await $.session.start({ cwd: "C:/work/project", surface: "desktop", isInteractive: true });
+  expect(await ui.find({ key: "acct" })).toBeUndefined();
+
+  const { text } = await $.command.run({ command: "account", args: "status" } as any);
+  expect(text).toMatch(/Band above the prompt: shown/);
+  expect(await ui.find({ key: "acct" })).toBeDefined();
+  expect(kept["session.s1"].hidden).toBe(false);
+  await ui.unmount();
+});
+
+test("another session's hide does not reach this one, and the old every-session hide is cleared", async ($, on) => {
+  const kept = keptStore(on, { "band.hidden": true, "session.other": { hidden: true, at: Date.now() } });
   world(on, alive(), {});
   await $.session.start({ cwd: "C:/work/project", surface: "terminal", isInteractive: true });
   const ui = await $.ui.mount({ ...band(), surface: "terminal" });
-  expect(await ui.find({ key: "acct" })).toBeUndefined();
-  const { text } = await $.command.run({ command: "account", args: "show" } as any);
-  expect(text).toMatch(/shown/);
   expect(await ui.find({ key: "acct" })).toBeDefined();
+  expect(kept["band.hidden"]).toBeUndefined();
   await ui.unmount();
+});
+
+// ---- what a session chose, past a restart of its process -------------------------------------
+
+test("a session started again finds the account it chose, ahead of the project's marker", async ($, on) => {
+  keptStore(on, { "session.s1": { account: "personal", source: "command", at: Date.now() } });
+  const env = world(on, alive(), { ANTHROPIC_BASE_URL: "https://host.example" }, [], "vbp\n");
+  await $.session.start({ cwd: "C:/work/project", surface: "terminal", isInteractive: true });
+  expect(env.ANTHROPIC_BASE_URL).toBe(`${RELAY}/acct/personal`);
+  await step($);
+  expect(sent.at(-1)).toBe(`${RELAY}/acct/personal`);
+  const { text } = await $.command.run({ command: "account", args: "status" } as any);
+  expect(text).toMatch(/bills: PERSONAL \(command\)/);
+});
+
+test("a choice of the window login is kept too; a session with no choice takes the marker", async ($, on) => {
+  const kept = keptStore(on);
+  const env = world(on, alive(), { ANTHROPIC_BASE_URL: "https://host.example" }, [], "vbp\n");
+  await $.session.start({ cwd: "C:/work/project", surface: "terminal", isInteractive: true });
+  expect(env.ANTHROPIC_BASE_URL).toBe(`${RELAY}/acct/vbp`);
+  expect(kept["session.s1"]).toBeUndefined();          // the marker is read again next time
+
+  await $.command.run({ command: "account", args: "off" } as any);
+  expect(kept["session.s1"].account).toBeNull();
+  await $.session.start({ cwd: "C:/work/project", surface: "terminal", isInteractive: true });
+  expect(env.ANTHROPIC_BASE_URL).toBe("https://host.example");
+});
+
+test("a dropdown pick, a command and an automatic switch are all kept", async ($, on) => {
+  const kept = keptStore(on);
+  world(on, alive(), { ANTHROPIC_BASE_URL: "https://host.example" });
+  probes(on, { vbp: rejected(2), personal: reading(0.1, 4, 0.1, 3) });
+  await $.session.start({ cwd: "C:/work/project", surface: "desktop", isInteractive: true });
+  const ui = await $.ui.mount({ ...band(), surface: "desktop" });
+  await ui.select({ key: "acct", value: "personal2" });
+  expect(kept["session.s1"]).toMatchObject({ account: "personal2", source: "button" });
+  await $.command.run({ command: "account", args: "vbp" } as any);
+  expect(kept["session.s1"]).toMatchObject({ account: "vbp", source: "command" });
+  await $.classic.StopFailure({ error: "rate_limit" } as any);
+  expect(kept["session.s1"].source).toBe("auto");
+  expect(kept["session.s1"].account).not.toBe("vbp");
+  await ui.unmount();
+});
+
+test("a choice made before this version is kept at the reload that brings it in", async ($, on) => {
+  const kept = keptStore(on);
+  const env = world(on, alive(), { ANTHROPIC_BASE_URL: "https://host.example" });
+  await $.session.start({ cwd: "C:/work/project", surface: "terminal", isInteractive: true });
+  await $.command.run({ command: "account", args: "vbp" } as any);
+  delete kept["session.s1"];                            // as an older version left it: in $.state alone
+  await $.session.start({ cwd: "C:/work/project", surface: "terminal", isInteractive: true });
+  expect(env.ANTHROPIC_BASE_URL).toBe(`${RELAY}/acct/vbp`);
+  expect(kept["session.s1"].account).toBe("vbp");
+});
+
+test("the session's id changing under the process reads its choice back, or carries this one over", async ($, on) => {
+  const kept = keptStore(on, { "session.s2": { account: "personal", source: "button", at: Date.now() } });
+  const env = world(on, alive(), { ANTHROPIC_BASE_URL: "https://host.example" });
+  await $.session.start({ cwd: "C:/work/project", surface: "terminal", isInteractive: true });
+  await $.command.run({ command: "account", args: "vbp" } as any);
+
+  sessionId = "s2";                                     // a /resume of another session
+  await $.turn.start({ turnId: "t2" } as any);
+  expect(env.ANTHROPIC_BASE_URL).toBe(`${RELAY}/acct/personal`);
+
+  sessionId = "s3";                                     // a /clear
+  await $.turn.start({ turnId: "t3" } as any);
+  expect(env.ANTHROPIC_BASE_URL).toBe(`${RELAY}/acct/personal`);
+  expect(kept["session.s3"].account).toBe("personal");
+});
+
+test("sessions untouched for a month are forgotten", async ($, on) => {
+  const kept = keptStore(on, {
+    "session.old": { account: "vbp", at: Date.now() - 31 * 86400e3 },
+    "session.new": { account: "vbp", at: Date.now() - 86400e3 },
+    "usage.window": { at: 1, h5: 0, h5_reset: null, d7: 0, d7_reset: null },
+  });
+  world(on, alive(), {});
+  await $.session.start({ cwd: "C:/work/project", surface: "terminal", isInteractive: true });
+  await clock.advance(1);
+  expect(kept["session.old"]).toBeUndefined();
+  expect(kept["session.new"]).toBeDefined();
+  expect(kept["usage.window"]).toBeDefined();
 });
 
 // ---- auto-switch on the usage limit ---------------------------------------------------------
@@ -385,4 +502,84 @@ test("with nothing to switch to, Claude Code's own continue at the reset goes th
   await $.classic.StopFailure({ error: "rate_limit" } as any);
   await $.prompt.submit({ text: RESET_PROMPT, isMeta: true, wait: false } as any);
   expect(submitted).toEqual([RESET_PROMPT]);
+});
+
+// ---- which accounts an automatic switch may move to -------------------------------------------
+
+for (const surface of ["terminal", "desktop"] as const) {
+  test(`one press takes an account out of the rotation, and the next switch skips it (${surface})`, async ($, on) => {
+    const kept = keptStore(on);
+    const env = world(on, alive(), { ANTHROPIC_BASE_URL: "https://host.example" });
+    probes(on, { vbp: rejected(2), personal2: reading(0.6, 3, 0.2, 3), personal: reading(0.1, 4, 0.1, 3) });
+    await $.session.start({ cwd: "C:/work/project", surface, isInteractive: true });
+    await $.command.run({ command: "account", args: "vbp" } as any);
+    const ui = await $.ui.mount({ ...band(), surface });
+
+    expect((await ui.find({ key: "rotate:personal" }))?.props.label).toBe("轮换 ✓");
+    expect(await ui.find({ key: "rotate:__window" })).toBeUndefined();
+    await ui.press({ key: "rotate:personal" });
+    expect((await ui.find({ key: "rotate:personal" }))?.props.label).toBe("轮换 ✗");
+    expect(kept["auto.excluded"]).toEqual(["personal"]);
+
+    await $.classic.StopFailure({ error: "rate_limit" } as any);
+    expect(env.ANTHROPIC_BASE_URL).toBe(`${RELAY}/acct/personal2`);  // most room, among those in the rotation
+
+    await ui.press({ key: "rotate:personal" });
+    expect((await ui.find({ key: "rotate:personal" }))?.props.label).toBe("轮换 ✓");
+    expect(kept["auto.excluded"]).toEqual([]);
+    await ui.unmount();
+  });
+}
+
+test("with every other account out of the rotation nothing switches; picking one by hand still works", async ($, on) => {
+  keptStore(on, { "auto.excluded": ["personal2", "personal"] });
+  const env = world(on, alive(), { ANTHROPIC_BASE_URL: "https://host.example" });
+  probes(on, { vbp: rejected(2), personal2: reading(0.1, 3, 0.2, 3), personal: reading(0.1, 4, 0.1, 3) });
+  await $.session.start({ cwd: "C:/work/project", surface: "terminal", isInteractive: true });
+  await $.command.run({ command: "account", args: "vbp" } as any);
+  await $.classic.StopFailure({ error: "rate_limit" } as any);
+  await clock.advance(5_000);
+  expect(env.ANTHROPIC_BASE_URL).toBe(`${RELAY}/acct/vbp`);
+  expect(submitted).toEqual([]);
+
+  await $.command.run({ command: "account", args: "personal" } as any);
+  expect(env.ANTHROPIC_BASE_URL).toBe(`${RELAY}/acct/personal`);
+});
+
+test("a press in another session reaches this band at the next refresh", async ($, on) => {
+  const kept = keptStore(on);
+  world(on, alive(), {});
+  await $.session.start({ cwd: "C:/work/project", surface: "desktop", isInteractive: true });
+  const ui = await $.ui.mount({ ...band(), surface: "desktop" });
+  kept["auto.excluded"] = ["vbp"];
+  await clock.advance(15_000);
+  expect((await ui.find({ key: "rotate:vbp" }))?.props.label).toBe("轮换 ✗");
+  await ui.unmount();
+});
+
+test("/account rotate sets it by keyboard, and status names who is left out", async ($, on) => {
+  const kept = keptStore(on);
+  world(on, alive(), {});
+  await $.session.start({ cwd: "C:/work/project", surface: "terminal", isInteractive: true });
+  expect((await $.command.run({ command: "account", args: "rotate vbp off" } as any)).text).toMatch(/left out/);
+  expect(kept["auto.excluded"]).toEqual(["vbp"]);
+  expect((await $.command.run({ command: "account", args: "status" } as any)).text).toMatch(/Left out of the rotation: vbp/);
+  expect((await $.command.run({ command: "account", args: "rotate vbp" } as any)).text).toMatch(/in the rotation/);
+  expect(kept["auto.excluded"]).toEqual([]);
+  expect((await $.command.run({ command: "account", args: "rotate nobody off" } as any)).text).toMatch(/No token/);
+});
+
+test("a narrow band keeps the toggle, without its word", async ($, on) => {
+  mock.store(on);
+  world(on, alive({ vbp: reading(0.5, 2, 0.2, 3) }), {});
+  await $.session.start({ cwd: "C:/work/project", surface: "terminal", isInteractive: true });
+  const label = async (cols: number) => {
+    const ui = await $.ui.mount({ ...band(cols), surface: "terminal" });
+    const l = (await ui.find({ key: "rotate:vbp" }))?.props.label;
+    await ui.unmount();
+    return l;
+  };
+  expect(await label(100)).toBe("轮换 ✓");
+  expect(await label(50)).toBe("✓");
+  expect(await label(34)).toBe("✓");
 });

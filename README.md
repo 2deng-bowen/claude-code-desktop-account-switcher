@@ -7,6 +7,8 @@
 - **输入框上方是一个下拉框 + 用量表**：选账号就切换；下面每个账号一行，5 小时 / 7 天各一条用量条（70% 变黄、90% 变红）、百分比和重置倒计时（`↻2h10m`），按窗口宽度自动收缩，不会被截断；用满的账号在下拉框里标“已满”。可以折叠成一行（“收起”），每 15 秒刷新。
 - **用量准、自己刷新**：relay 每 15 分钟（或某个窗口重置之后）给每个账号发一个 1 token 的 haiku 请求，读回复头里的真实用量和“是否已被拒”，没用过的号也有数；窗口账号的用量直接读官方用量接口（和 `/usage` 同一个数）。输入框上方的 **↻** 或 `/account refresh` 立刻全部刷新。
 - **撞限额自动换号继续**（默认开，“自动切换 ✓/✗” 或 `/account auto on|off`）：一轮因为额度用完而中断时，换到剩余额度最多的 relay 账号，并自动发一条「继续」接着干；发消息前如果已知当前号满了，就先切再发。**永远不会自动切到窗口账号**；所有 relay 账号都满了就只提示不切；10 分钟内最多自动切 4 次，防止来回跳。
+- **每个账号一个轮换开关**：用量表每行末尾的“轮换 ✓/✗”点一下，就决定自动切换能不能切到这个号（所有 session 通用，手动选不受影响）；键盘用 `/account rotate <name> on|off`。
+- **session 重启不丢账号**：桌面端重启 session 的进程（崩溃、闲置很久）后，还是之前选的账号，不会悄悄变回窗口账号。“隐藏”只影响当前 session；任何 `/account`（`hide` 除外）都会把账号条带回来。
 - **subagent 跟着切**：每一个模型请求（主对话和所有 subagent）发出前都重新指向当前账号，切号后正在跑的 subagent 下一个请求就换过去。
 - **不会偷偷退回窗口账号**：原版在读 relay 状态失败时会悄悄把整个会话换回 desktop 登录的账号，那个号额度用完就是莫名其妙的 rate limit。现在选了账号就一直走它；relay 真的没响应时请求会重试，输入框上方会提示，并给一个“改用窗口账号”的按钮。
 - **查哪些请求绕过了 relay**：`python "$HOME\.claude\account-switcher\scripts\check-routing.py" <会话 id>`，逐条对照会话记录和 relay 日志（主对话 + 每个 subagent）。
@@ -44,7 +46,7 @@ powershell -ExecutionPolicy Bypass -File "$HOME\.claude\account-switcher\scripts
 Bill a Claude Code session to a different Claude subscription, per project or on demand, inside **one** Claude Desktop app or one terminal. No logout, no restart, no second copy of the app.
 
 - A project folder with `.claude/account` containing `work` bills every session opened there to the account named `work`.
-- A band above the prompt holds a dropdown: the app's own login and every account that has a token, each with its last 5-hour / 7-day usage. A pick switches the current session from its next message; beside it, the chosen account's usage and when each window resets; `hide` puts the band away (remembered; `/account show` brings it back).
+- A band above the prompt holds a dropdown: the app's own login and every account that has a token, each with its last 5-hour / 7-day usage. A pick switches the current session from its next message; beside it, the chosen account's usage and when each window resets; `hide` puts the band away in that session (any `/account` but `/account hide` brings it back). A session's choice survives a restart of its process.
 - `/account <name>` does the same by keyboard; `/account off` returns to the app's own login; `/account` shows status, token expiry and each account's real usage meters.
 - The status line reads `💳 billing: WORK` whenever a session is routed. Every model request, main's and every subagent's, is pointed at the chosen account right before it is sent. A chosen account is never swapped for the app's login behind your back: if the relay is not answering, requests keep going to it and retry (the band offers a one-press switch to the app's login); only a name the relay holds no token for falls back, and the status line says so.
 
@@ -100,8 +102,8 @@ Open a new Claude Code session afterwards; existing sessions do not load the plu
 ## Use
 
 - Put `.claude/account` with the account name in any project that should bill another account.
-- In a session: pick an account in the dropdown above the prompt, or `/account`, `/account work`, `/account off`, `/account refresh`, `/account auto on|off`, `/account hide`, `/account show`.
-- Auto-switch (on by default): when a turn stops on the usage limit, the session moves to the relay account with the most room left and sends 「继续」; it never moves to the app's own login automatically.
+- In a session: pick an account in the dropdown above the prompt, or `/account`, `/account work`, `/account off`, `/account refresh`, `/account auto on|off`, `/account rotate <name> on|off`, `/account hide`, `/account show`.
+- Auto-switch (on by default): when a turn stops on the usage limit, the session moves to the relay account with the most room left and sends 「继续」; it never moves to the app's own login, or to an account whose "轮换" toggle in the usage table is off.
 - Renew a token near expiry (the status line warns at 14 days): run add-account for that name again.
 - Remove: `scripts\uninstall.ps1` / `scripts/uninstall.sh` (`-PurgeTokens` / `--purge-tokens` to delete the token store too).
 

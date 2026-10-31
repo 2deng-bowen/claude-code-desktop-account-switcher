@@ -15,8 +15,12 @@
 //
 // Auto-switch (on by default, "自动" in the band, `/account auto on|off`): when a turn dies on the
 // usage limit, the session moves to the relay account with the most room left (never the window
-// login) and sends "继续" so the work goes on; and a turn about to start on an account already
-// known to be refused moves first.
+// login, nor an account switched out of the rotation by its "轮换" toggle) and sends "继续" so the
+// work goes on; and a turn about to start on an account already known to be refused moves first.
+//
+// What a session chose outlives its process: the desktop app restarts a session's process (a crash,
+// a long idle), and `$.state` goes with it, so the choice is also kept in `$.store` under the
+// session's id and read back when the session starts again.
 
 import { atom, read, update } from "claude-code";
 import type { Billing, Usage, UsageMap } from "../types";
@@ -26,7 +30,10 @@ const STALE_S = 30;
 const WARN_DAYS = 14;
 const REFRESH_MS = 15_000;
 const OLD_S = 3600; // a usage reading older than this draws dimmed
-const HIDDEN_KEY = "band.hidden"; // $.store: the hide choice outlives the session
+const OLD_HIDDEN_KEY = "band.hidden"; // $.store: where a hide used to live, for every session; removed on sight
+const SESSION_PREFIX = "session."; // $.store: + session id = what that session chose (Saved)
+const SESSION_KEEP_MS = 30 * 86400_000; // a session untouched for this long is forgotten
+const EXCLUDED_KEY = "auto.excluded"; // $.store: accounts an automatic switch never moves to, for every session
 const COLLAPSED_KEY = "band.collapsed"; // $.store: so does folding the usage table away
 const WINDOW_USAGE_KEY = "usage.window"; // $.store: the window login's last reading outlives the session
 const WINDOW = "__window"; // the dropdown's value (and usage key) for the window's own login
@@ -39,6 +46,8 @@ const USAGE_API = "https://api.anthropic.com/api/oauth/usage";
 
 type Heartbeat = { port: number; pid: number; at: number; accounts: string[]; expires?: Record<string, string>; usage?: Record<string, Usage> };
 type RateLimit = { kind: string; percentUsed: number; resetsAt?: string };
+// A session's choices. `account` is absent until one was chosen; null is the window login, chosen.
+type Saved = { account?: string | null; source?: Billing["source"]; hidden?: boolean; at: number };
 
 // What the band draws from. Held by the host, so a hot reload keeps the chosen account.
 const billing = atom({ plugin: "account-switcher", key: "billing" } as const, {
@@ -48,12 +57,14 @@ const isHidden = atom({ plugin: "account-switcher", key: "isHidden" } as const, 
 const isCollapsed = atom({ plugin: "account-switcher", key: "isCollapsed" } as const, false);
 const usage = atom({ plugin: "account-switcher", key: "usage" } as const, {} as UsageMap);
 const autoSwitch = atom({ plugin: "account-switcher", key: "autoSwitch" } as const, true);
+const excluded = atom({ plugin: "account-switcher", key: "excluded" } as const, [] as string[]);
 
 let store = "";
 let hb: Heartbeat | null = null;
 let warned = false;
 let routedTo: string | null = null; // where this session's requests go now; null = the window login
 let autoTimes: number[] = []; // when the recent automatic switches happened
+let sessionSeen: string | null = null; // the store key of the session last read back
 let pendingContinue = false; // an automatic switch is waiting to send CONTINUE_TEXT
 let skipResetContinue = false; // drop the engine's own continue at the limit reset: we already moved on
 // The prompt Claude Code queues itself when a usage limit it waited out resets.
@@ -126,16 +137,17 @@ function cells(s: string): number {
 }
 
 // The usage table's columns fitted to the band's width: bars shrink first, then go, then the
-// reset countdowns go. Row = marker 2 + name + 2 + group + 2 + group; group = "5h " 3 + bar+1 + pct 4 + reset 8.
-type Layout = { name: number; bar: number; reset: boolean };
+// rotation toggle loses its word, then the reset countdowns go. Row = marker 2 + name + 2 + group +
+// 2 + group + toggle; group = "5h " 3 + bar+1 + pct 4 + reset 8; toggle = "轮换 ✓" 7 or "✓" 2.
+type Layout = { name: number; bar: number; reset: boolean; wide: boolean };
 function layout(cols: number, name: number): Layout {
-  for (const reset of [true, false]) {
-    const base = 2 + name + 2 + 2 + 2 * (3 + 4 + (reset ? 8 : 0));
+  for (const [reset, wide] of [[true, true], [true, false], [false, false]] as const) {
+    const base = 2 + name + 2 + 2 + 2 * (3 + 4 + (reset ? 8 : 0)) + (wide ? 7 : 2);
     const bar = Math.min(12, Math.floor((cols - base) / 2) - 1);
-    if (bar >= 4) return { name, bar, reset };
-    if (cols >= base) return { name, bar: 0, reset };
+    if (bar >= 4) return { name, bar, reset, wide };
+    if (cols >= base) return { name, bar: 0, reset, wide };
   }
-  return { name, bar: 0, reset: false };
+  return { name, bar: 0, reset: false, wide: false };
 }
 
 // The session's own rate-limit readings (percent, ISO resets) in the relay's shape.
@@ -196,18 +208,35 @@ async function probe($: any): Promise<void> {
   await refreshUsage($, fresh);
 }
 
-// The relay account with the most room left, other than `not`; null when every one is refused.
-// Never the window login: an automatic switch does not bill the desktop app's own account.
-// Unread accounts rank after read ones with room.
+// The accounts an automatic switch must not move to, as the store has them now (any session may
+// have pressed a toggle); the band's copy follows, redrawing only on a change.
+async function refreshExcluded($: any): Promise<string[]> {
+  const v = await $.store.get(EXCLUDED_KEY);
+  const off: string[] = Array.isArray(v) ? v.filter((n) => typeof n === "string") : [];
+  if (JSON.stringify(off) !== JSON.stringify(await read($, excluded))) await update($, excluded, () => off);
+  return off;
+}
+
+async function setRotates($: any, name: string, rotates: boolean): Promise<void> {
+  const off = (await refreshExcluded($)).filter((n) => n !== name);
+  if (!rotates) off.push(name);
+  await $.store.set(EXCLUDED_KEY, off);
+  await update($, excluded, () => off);
+}
+
+// The relay account in the rotation with the most room left, other than `not`; null when every one
+// is refused. Never the window login: an automatic switch does not bill the desktop app's own
+// account. Unread accounts rank after read ones with room.
 async function bestAccount($: any, not: string): Promise<string | null> {
   const u = await read($, usage);
+  const off = await refreshExcluded($);
   const room = (k: string) => {
     const x = u[k];
     if (!x) return 0.5;
     const [h5, d7] = windows(x);
     return 1 - Math.max(h5.pct ?? 0, d7.pct ?? 0) / 100;
   };
-  const names = (hb?.accounts ?? []).filter((k) => k !== not && !isFull(u[k]));
+  const names = (hb?.accounts ?? []).filter((k) => k !== not && !off.includes(k) && !isFull(u[k]));
   names.sort((a, b) => room(b) - room(a));
   return names[0] ?? null;
 }
@@ -224,11 +253,11 @@ async function autoMove($: any, why: string): Promise<string | null> {
   const from = (await read($, billing)).account ?? WINDOW;
   const to = await bestAccount($, from);
   if (!to) {
-    $.ui.toast("account-switcher: every relay account is at its limit — nothing to switch to (the window account is never picked automatically)");
+    $.ui.toast("account-switcher: every account in the rotation is at its limit — nothing to switch to (the window account is never picked automatically)");
     return null;
   }
   autoTimes.push(now);
-  await apply($, to, "auto");
+  await chooseAccount($, to, "auto");
   const name = (k: string) => (k === WINDOW ? WINDOW_NAME : k);
   $.ui.toast(`account-switcher: ${name(from)} ${why} → switched to ${name(to)}`);
   return to;
@@ -317,6 +346,58 @@ async function apply($: any, account: string | null, source: Billing["source"]):
   return s;
 }
 
+// ---- what a session chose, kept past its process ----------------------------------------------
+
+async function sessionKey($: any): Promise<string | null> {
+  try {
+    const id = await $.session.id();
+    return id ? SESSION_PREFIX + id : null;
+  } catch { return null; }
+}
+
+async function saveSession($: any, patch: Partial<Saved>): Promise<void> {
+  try {
+    const k = await sessionKey($);
+    if (k) await $.store.set(k, { ...((await $.store.get(k)) as Saved | undefined), ...patch, at: Date.now() });
+  } catch { /* keeping it is a nicety: never fail a choice over it */ }
+}
+
+// An account chosen for this session, by the person or an automatic switch: in force now, and found
+// again after a restart of the session's process.
+async function chooseAccount($: any, account: string | null, source: Billing["source"]): Promise<string> {
+  const s = await apply($, account, source);
+  await saveSession($, { account, source });
+  return s;
+}
+
+// Read back what this session chose; true when that settled its account.
+async function restoreSession($: any): Promise<boolean> {
+  const k = await sessionKey($);
+  sessionSeen = k;
+  const saved = (k ? await $.store.get(k) : undefined) as Saved | undefined;
+  if (!saved) return false;
+  await update($, isHidden, () => saved.hidden === true);
+  if (!("account" in saved)) return false;
+  await apply($, saved.account ?? null, saved.source ?? null);
+  return true;
+}
+
+// The session's id can change under a running process (/clear, /resume): read back what the new one
+// chose, or carry this one's choice over to it.
+async function followSession($: any): Promise<void> {
+  if ((await sessionKey($)) === sessionSeen || (await restoreSession($))) return;
+  const b = await read($, billing);
+  if (b.source && b.source !== "marker") await saveSession($, { account: b.account, source: b.source });
+}
+
+async function pruneSessions($: any): Promise<void> {
+  for (const k of (await $.store.keys()) as string[]) {
+    if (!k.startsWith(SESSION_PREFIX)) continue;
+    const saved = (await $.store.get(k)) as Saved | undefined;
+    if (!saved?.at || Date.now() - saved.at > SESSION_KEEP_MS) await $.store.delete(k);
+  }
+}
+
 async function reapply($: any): Promise<string> {
   const b = await read($, billing);
   return apply($, b.account, b.source);
@@ -333,6 +414,8 @@ async function route($: any): Promise<void> {
 // The timer's tick: re-read the heartbeat; re-route only when the relay came up, went down or
 // changed its accounts, otherwise just refresh the usage figures.
 async function tick($: any): Promise<void> {
+  await followSession($);
+  await refreshExcluded($);
   const before = JSON.stringify([!!hb, hb?.accounts ?? []]);
   hb = await readHeartbeat($);
   if (JSON.stringify([!!hb, hb?.accounts ?? []]) !== before) await reapply($);
@@ -353,7 +436,7 @@ async function setAuto($: any, on: boolean): Promise<void> {
 
 async function setHidden($: any, hidden: boolean): Promise<void> {
   await update($, isHidden, () => hidden);
-  await $.store.set(HIDDEN_KEY, hidden);
+  await saveSession($, { hidden });
 }
 
 async function setCollapsed($: any, collapsed: boolean): Promise<void> {
@@ -388,7 +471,7 @@ function bar(ui: any, surface: string, w: Win, width: number, dim: boolean) {
 }
 
 // One account's row of the usage table: marker, name, then each window's bar, percent and reset.
-function usageRow(ui: any, surface: string, key: string, name: string, u: Usage | undefined, isCurrent: boolean, L: Layout) {
+function usageRow(ui: any, surface: string, key: string, name: string, u: Usage | undefined, isCurrent: boolean, L: Layout, toggle: any) {
   const { Box, Text } = ui;
   const dim = !!u && Date.now() / 1000 - u.at > OLD_S;
   const head = [
@@ -396,7 +479,7 @@ function usageRow(ui: any, surface: string, key: string, name: string, u: Usage 
     <Box key="n" width={L.name + 2}><Text bold={isCurrent} dimColor={!isCurrent && dim} wrap="truncate-end">{name}</Text></Box>,
   ];
   if (!u) {
-    return <Box key={key} flexDirection="row">{head}<Text dimColor>暂无数据 · 用过一次后显示</Text></Box>;
+    return <Box key={key} flexDirection="row" gap={1}>{head}<Text dimColor>暂无数据 · 用过一次后显示</Text>{toggle}</Box>;
   }
   const group = (label: string, w: Win, k: string) => (
     <Box key={k} flexDirection="row" marginRight={2}>
@@ -407,29 +490,33 @@ function usageRow(ui: any, surface: string, key: string, name: string, u: Usage 
     </Box>
   );
   const [h5, d7] = windows(u);
-  return <Box key={key} flexDirection="row">{head}{group("5h", h5, "h5")}{group("7d", d7, "d7")}</Box>;
+  return <Box key={key} flexDirection="row">{head}{group("5h", h5, "h5")}{group("7d", d7, "d7")}{toggle}</Box>;
 }
 
 export function register(on: any) {
   on("session.start", async ($: any, e: any, next: any) => {
     store = dir($.plugin.root);
-    const hidden = (await $.store.get(HIDDEN_KEY)) === true;
+    await $.store.delete(OLD_HIDDEN_KEY);
     const collapsed = (await $.store.get(COLLAPSED_KEY)) === true;
-    await update($, isHidden, () => hidden);
     await update($, isCollapsed, () => collapsed);
     const auto = (await $.store.get(AUTO_KEY)) !== false;
     await update($, autoSwitch, () => auto);
+    await refreshExcluded($);
     const b = await read($, billing);
-    if (b.account || b.host) {
+    if (await restoreSession($)) {
+      // what this session chose before its process last ended
+    } else if (b.account || b.host) {
       await apply($, b.account, b.source);            // a reload: keep what this session chose
+      if (b.source && b.source !== "marker") await saveSession($, { account: b.account, source: b.source });
     } else {
       const m = await readMarker($);
       await apply($, m, m ? "marker" : null);
     }
+    pruneSessions($).catch(() => {});
     await $.command.register({
       name: "account",
       description: "Bill this session to another Claude account (via the account-switcher relay)",
-      argumentHint: "[name | off | status | refresh | auto on|off | show | hide]",
+      argumentHint: "[name | off | status | refresh | auto on|off | rotate <name> on|off | show | hide]",
     });
     $.clock.every(REFRESH_MS, () => { tick($).catch(() => {}); });
     probe($).catch(() => {});
@@ -439,6 +526,7 @@ export function register(on: any) {
   // A main turn about to start on an account already known to be refused moves first, so its
   // first request does not spend itself on a 429.
   on("turn.start", async ($: any, e: any, next: any) => {
+    await followSession($);
     await reapply($);
     if (e.agentId === undefined && (await read($, autoSwitch))) {
       const b = await read($, billing);
@@ -473,6 +561,7 @@ export function register(on: any) {
       skipResetContinue = false;
       return { drop: "account-switcher: already switched accounts and continued — skipping the built-in continue at the limit reset" };
     }
+    await followSession($);
     await reapply($);
     return next(e);
   });
@@ -504,8 +593,9 @@ export function register(on: any) {
 
   // The band above the prompt: a dropdown of the window login and every account the relay holds a
   // token for, then a table of each account's 5-hour and 7-day usage (bar, percent, time to reset)
-  // fitted to the band's width. "用量 / 收起" folds the table to one line, "隐藏" puts the band
-  // away; both are remembered across sessions (`/account show` brings the band back).
+  // fitted to the band's width, and on each account's row a toggle for whether an automatic switch
+  // may move to it, for every session. "用量 / 收起" folds the table to one line, for every session;
+  // "隐藏" puts the band away in this session alone (any `/account` but `hide` brings it back).
   on("ui.render", { component: "AbovePrompt" }, async ($: any, e: any, next: any) => {
     if (e.props.hasSurvey || (await read($, isHidden))) return next(e);
     const b = await read($, billing);
@@ -513,11 +603,11 @@ export function register(on: any) {
     const collapsed = await read($, isCollapsed);
     const ui = $.ui.resolve(e);
     const { Box, Button, Select, Text } = ui;
-    const hide = <Button key="hide" label="隐藏" dimColor role="dismiss" onPress={() => setHidden($, true)} />;
+    const hide = <Button key="hide" label="隐藏" dimColor role="dismiss" onPress={async () => { await setHidden($, true); $.ui.toast("account-switcher: 这个 session 的账号条已隐藏 · /account show 恢复"); }} />;
     if (!b.relayUp) {
       // The chosen account stays in force (its requests retry until the relay is back); going
       // over to the window login is the person's call, one press away.
-      const toWindow = async () => { $.ui.toast(`account-switcher: ${await apply($, null, null)}`); };
+      const toWindow = async () => { $.ui.toast(`account-switcher: ${await chooseAccount($, null, null)}`); };
       return b.account ? (
         <Box flexDirection="row" gap={1}>
           <Text>💳 {b.account}</Text>
@@ -539,7 +629,7 @@ export function register(on: any) {
     if (b.account && !b.accounts.includes(b.account)) options.push({ value: b.account, label: `${b.account}（无 token）` });
     const choose = async (value: string) => {
       const name = value === WINDOW ? null : value;
-      const s = await apply($, name, name ? "button" : null);
+      const s = await chooseAccount($, name, name ? "button" : null);
       $.ui.toast(`account-switcher: ${s} — from the next message on (subagents too)`);
     };
     const auto = await read($, autoSwitch);
@@ -555,16 +645,24 @@ export function register(on: any) {
     );
     if (collapsed) return header;
     const L = layout(Number(e.props.bodyColumns) || 80, Math.max(...names.map(([, n]) => cells(n))));
+    const off = await read($, excluded);
+    // The window login is never moved to automatically, so its row has no toggle.
+    const toggle = (value: string) => {
+      if (value === WINDOW) return null;
+      const rotates = !off.includes(value), mark = rotates ? "✓" : "✗";
+      return <Button key={`rotate:${value}`} label={L.wide ? `轮换 ${mark}` : mark} plain dimColor={!rotates} onPress={() => setRotates($, value, !rotates)} />;
+    };
     return (
       <Box flexDirection="column">
         {header}
-        {names.map(([value, name]) => usageRow(ui, e.surface, `row:${value}`, name, u[value], value === current, L))}
+        {names.map(([value, name]) => usageRow(ui, e.surface, `row:${value}`, name, u[value], value === current, L, toggle(value)))}
       </Box>
     );
   });
 
   on("command.run", { command: "account" }, async ($: any, e: any) => {
     const arg = (e.args ?? "").trim().toLowerCase();
+    if (arg !== "hide" && (await read($, isHidden))) await setHidden($, false); // whoever asks for the account wants to see it
     hb = await readHeartbeat($);
     await refreshUsage($);
     const known = hb?.accounts ?? [];
@@ -579,15 +677,25 @@ export function register(on: any) {
       for (const n of [WINDOW, ...known]) if (u[n]) lines.push(`  ${n === WINDOW ? "window account" : n} usage: ${detail(u[n])}`);
       lines.push(`Band above the prompt: ${(await read($, isHidden)) ? "hidden (/account show)" : "shown (/account hide)"}`);
       lines.push(`Auto-switch on the usage limit: ${(await read($, autoSwitch)) ? "on" : "off"} (/account auto on|off)`);
-      lines.push("Usage: /account <name> · /account off · /account refresh · marker file .claude/account in a project");
+      const off = await refreshExcluded($);
+      if (off.length) lines.push(`Left out of the rotation: ${off.join(", ")} (/account rotate <name> on)`);
+      lines.push("Usage: /account <name> · /account off · /account refresh · /account rotate <name> on|off · marker file .claude/account in a project");
       return { text: lines.join("\n") };
     }
     if (arg === "show" || arg === "hide") {
       await setHidden($, arg === "hide");
-      return { text: arg === "hide" ? "Band hidden in every session; /account show brings it back." : "Band shown above the prompt." };
+      return { text: arg === "hide" ? "Band hidden in this session; /account show brings it back." : "Band shown above the prompt." };
     }
     if (arg === "off") {
-      return { text: await apply($, null, null) };
+      return { text: await chooseAccount($, null, null) };
+    }
+    const rotate = arg.match(/^rotate\s+(\S+)(?:\s+(on|off))?$/);
+    if (rotate) {
+      const [, name, want] = rotate;
+      if (!known.includes(name)) return { text: `No token for '${name}'. Known: ${known.join(", ") || "none"}.` };
+      const rotates = want ? want === "on" : (await refreshExcluded($)).includes(name);
+      await setRotates($, name, rotates);
+      return { text: rotates ? `${name}: in the rotation; an automatic switch may move to it.` : `${name}: left out of the rotation; only you can switch to it.` };
     }
     if (arg === "auto on" || arg === "auto off" || arg === "auto") {
       const enable = arg === "auto" ? !(await read($, autoSwitch)) : arg === "auto on";
@@ -602,6 +710,6 @@ export function register(on: any) {
     if (!known.includes(arg)) {
       return { text: hb ? `No token for '${arg}'. Known: ${known.join(", ") || "none"}. Add one with scripts/add-account.ps1 -Name ${arg} (Windows) or scripts/add-account.sh ${arg} (macOS/Linux)` : "Relay is down; start it (Windows: scheduled task ClaudeAccountRelay · Linux: systemctl --user start claude-account-relay · macOS: launchctl kickstart gui/$(id -u)/com.claude-account-switcher.relay) and try again." };
     }
-    return { text: `${await apply($, arg, "command")} — from the next message on (subagents too)` };
+    return { text: `${await chooseAccount($, arg, "command")} — from the next message on (subagents too)` };
   });
 }

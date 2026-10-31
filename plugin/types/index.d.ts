@@ -31,6 +31,6 @@ export type UsageMap = Record<string, Usage>;
 
 declare module "claude-code" {
   interface PluginState {
-    "account-switcher": { billing: Billing; isHidden: boolean; isCollapsed: boolean; usage: UsageMap; autoSwitch: boolean };
+    "account-switcher": { billing: Billing; isHidden: boolean; isCollapsed: boolean; usage: UsageMap; autoSwitch: boolean; excluded: string[] };
   }
 }
